@@ -1,0 +1,76 @@
+diff --git a/kernels/5_18_18_barrier/fs/buffer.c b/kernels/5_18_18_barrier/fs/buffer.c
+index 5ac6479..3fe26c9 100644
+--- a/kernels/5_18_18_barrier/fs/buffer.c
++++ b/kernels/5_18_18_barrier/fs/buffer.c
+@@ -3084,7 +3084,7 @@ int submit_bh(int op, int op_flags, struct buffer_head *bh)
+ int dispatch_bio_bh(struct bio *bio)
+ {
+ 	if ((bio->bi_end_io == end_bio_bh_io_sync) && bio->bi_private) {
+-		struct buffer_head *bh = bio->bi_private;
++		// struct buffer_head *bh = bio->bi_private;
+ 		
+ 		wake_up_buffer_dispatch(bio->bi_private);
+ 		return 1;
+diff --git a/kernels/5_18_18_barrier/fs/jbd2/commit.c b/kernels/5_18_18_barrier/fs/jbd2/commit.c
+index 98ec62e..f4b389f 100644
+--- a/kernels/5_18_18_barrier/fs/jbd2/commit.c
++++ b/kernels/5_18_18_barrier/fs/jbd2/commit.c
+@@ -2124,7 +2124,7 @@ void jbd2_journal_barrier_flush_transaction(journal_t *journal)
+ 			if (is_journal_aborted(journal))
+ 				clear_buffer_jbddirty(bh);
+ 		} else {
+-			J_ASSERT_BH(bh, !buffer_dirty(bh));
++			// J_ASSERT_BH(bh, !buffer_dirty(bh));
+ 			/*
+ 			 * The buffer on BJ_Forget list and not jbddirty means
+ 			 * it has been freed by this transaction and hence it
+diff --git a/kernels/5_18_18_barrier/fs/jbd2/journal.c b/kernels/5_18_18_barrier/fs/jbd2/journal.c
+index f2a6009..fab312f 100644
+--- a/kernels/5_18_18_barrier/fs/jbd2/journal.c
++++ b/kernels/5_18_18_barrier/fs/jbd2/journal.c
+@@ -398,7 +398,7 @@ static int jbd2_journal_start_flush_thread(journal_t *journal)
+ 	if (IS_ERR(t))
+ 		return PTR_ERR(t);
+ 
+-	wait_event(journal->j_wait_done_flush, journal->j_task != NULL);
++	wait_event(journal->j_wait_done_flush, journal->j_task_flush != NULL);
+ 	return 0;
+ }
+ 
+diff --git a/kernels/5_18_18_barrier/fs/jbd2/transaction.c b/kernels/5_18_18_barrier/fs/jbd2/transaction.c
+index ff101a3..6df9270 100644
+--- a/kernels/5_18_18_barrier/fs/jbd2/transaction.c
++++ b/kernels/5_18_18_barrier/fs/jbd2/transaction.c
+@@ -931,6 +931,7 @@ void jbd2_journal_unlock_updates (journal_t *journal)
+ 	wake_up(&journal->j_wait_transaction_locked);
+ }
+ 
++/* CJFS */ /*
+ static void warn_dirty_buffer(struct buffer_head *bh)
+ {
+ 	printk(KERN_WARNING
+@@ -938,7 +939,7 @@ static void warn_dirty_buffer(struct buffer_head *bh)
+ 	       "There's a risk of filesystem corruption in case of system "
+ 	       "crash.\n",
+ 	       bh->b_bdev, (unsigned long long)bh->b_blocknr);
+-}
++} */
+ 
+ /* CJFS */
+ /* Call t_frozen trigger and copy buffer data into jh->b_frozen_data. */
+@@ -1149,6 +1150,7 @@ static void jbd2_freeze_jh_data(struct journal_head *jh, unsigned int tid)
+ 	 * primary copy is already going to disk then we cannot do copy-out
+ 	 * here.
+ 	 */
++	/*
+ 	if (buffer_shadow(bh)) {
+ 		JBUFFER_TRACE(jh, "on shadow: sleep");
+ 		spin_unlock(&jh->b_state_lock);
+@@ -1157,6 +1159,7 @@ static void jbd2_freeze_jh_data(struct journal_head *jh, unsigned int tid)
+ 				__func__ ,transaction->t_tid);
+ 		goto repeat;
+ 	}
++	*/
+ 
+ 	/*
+ 	 * Only do the copy if the currently-owning transaction still needs it.

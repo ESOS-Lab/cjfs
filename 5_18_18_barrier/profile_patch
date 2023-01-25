@@ -1,0 +1,300 @@
+diff --git a/kernels/5_18_18_barrier/fs/ext4/fsync.c b/kernels/5_18_18_barrier/fs/ext4/fsync.c
+index c342558..ed7e70f 100644
+--- a/kernels/5_18_18_barrier/fs/ext4/fsync.c
++++ b/kernels/5_18_18_barrier/fs/ext4/fsync.c
+@@ -126,6 +126,15 @@ static int ext4_fsync_journal(struct inode *inode, bool datasync,
+  * What we do is just kick off a commit and wait on it.  This will snapshot the
+  * inode to disk.
+  */
++#define DEBUG_FSYNC_LATENCY
++#ifdef DEBUG_FSYNC_LATENCY
++typedef struct {
++	s64 fsync_intv[1];
++} fsync_data;
++
++extern fsync_data fsync_array[4000000];
++extern atomic_t fsync_index;
++#endif
+ int ext4_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
+ {
+ 	int ret = 0, err;
+@@ -137,6 +146,17 @@ int ext4_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
+ 	struct ext4_inode_info *ei = EXT4_I(inode);
+ 	tid_t commit_tid = datasync ? ei->i_datasync_tid : ei->i_sync_tid;
+ 
++#ifdef DEBUG_FSYNC_LATENCY
++	ktime_t start1, end1;
++	fsync_data temp;
++	int j = 0, seq = 0;
++
++	for (j = 0; j < 1; j++) {
++		temp.fsync_intv[j] = 0;
++	}
++	start1 = ktime_get();
++#endif
++
+ 	if (unlikely(ext4_forced_shutdown(sbi)))
+ 		return -EIO;
+ 
+@@ -201,6 +221,14 @@ int ext4_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
+ 	if (ret == 0)
+ 		ret = err;
+ 	trace_ext4_sync_file_exit(inode, ret);
++#ifdef DEBUG_FSYNC_LATENCY
++	end1 = ktime_get();
++	seq = atomic_add_return(1, &fsync_index);
++	temp.fsync_intv[0] += ktime_to_ns(ktime_sub(end1,start1));
++	for (j = 0; j < 1; j++) {                                  
++        	fsync_array[seq-1].fsync_intv[j] = temp.fsync_intv[j];
++	}                                                      
++#endif
+ 	return ret;
+ }
+ 
+diff --git a/kernels/5_18_18_barrier/fs/jbd2/commit.c b/kernels/5_18_18_barrier/fs/jbd2/commit.c
+index 7fd8aca..c457bfe 100644
+--- a/kernels/5_18_18_barrier/fs/jbd2/commit.c
++++ b/kernels/5_18_18_barrier/fs/jbd2/commit.c
+@@ -1223,6 +1223,15 @@ void jbd2_journal_commit_transaction(journal_t *journal)
+ 	spin_unlock(&journal->j_history_lock);
+ }
+ 
++#ifdef DEBUG_PROC_OP
++typedef struct {
++	s64 op_intv[1];
++} op_data; 
++extern op_data op_array[4000000];
++extern atomic_t op_index;
++#endif
++
++
+ /*
+  * jbd2_journal_barrier_commit_transaction
+  *
+@@ -1267,6 +1276,8 @@ void jbd2_journal_barrier_commit_transaction(journal_t *journal)
+ 	LIST_HEAD(t_log_bufs);
+ 	/* CJFS */
+ 	int ver_tid;
++	ktime_t start;
++	int seq;
+ 
+ 	if (jbd2_journal_has_csum_v2or3(journal))
+ 		csum_size = sizeof(struct jbd2_journal_block_tail);
+@@ -1337,6 +1348,8 @@ void jbd2_journal_barrier_commit_transaction(journal_t *journal)
+ 	read_unlock(&journal->j_state_lock);
+ #endif
+ 
++	start = ktime_get();
++
+ 	trace_jbd2_start_commit(journal, commit_transaction);
+ 	jbd_debug(1, "JBD2: starting commit of transaction %d\n",
+ 			commit_transaction->t_tid);
+@@ -1389,6 +1402,12 @@ void jbd2_journal_barrier_commit_transaction(journal_t *journal)
+ 	}
+ 	write_lock(&journal->j_state_lock);
+ #endif
++#ifdef DEBUG_PROC_OP
++	seq = atomic_add_return(1, &op_index);
++	op_array[seq - 1].op_intv[0] = ktime_to_ns(ktime_sub(ktime_get(),start));
++	printk(KERN_INFO "[SWDBG] (%s) seq : %d, lockup time : %d\n",
++				__func__, seq - 1, op_array[seq - 1].op_intv[0]);
++#endif
+ 
+ 	/*
+ 	 * First thing we are allowed to do is to discard any remaining
+@@ -2210,7 +2229,6 @@ void jbd2_journal_barrier_flush_transaction(journal_t *journal)
+ 	write_unlock(&journal->j_state_lock);
+ 	wake_up(&journal->j_wait_done_commit);
+ 	wake_up(&journal->j_fc_wait);
+-
+ 	/*
+ 	 * Calculate overall stats
+ 	 */
+diff --git a/kernels/5_18_18_barrier/fs/jbd2/journal.c b/kernels/5_18_18_barrier/fs/jbd2/journal.c
+index fab312f..c036bc5 100644
+--- a/kernels/5_18_18_barrier/fs/jbd2/journal.c
++++ b/kernels/5_18_18_barrier/fs/jbd2/journal.c
+@@ -100,6 +100,28 @@
+ 
+ static int jbd2_journal_create_slab(size_t slab_size);
+ 
++#ifdef DEBUG_PROC_OP
++/* Tx Lock-Up Interval */
++typedef struct {
++	s64 op_intv[1];
++} op_data;
++
++atomic_t op_index;
++EXPORT_SYMBOL(op_index);
++op_data op_array[4000000];
++EXPORT_SYMBOL(op_array);
++
++/* fsync Latency */
++typedef struct {
++	s64 fsync_intv[1];
++} fsync_data;
++
++atomic_t fsync_index;
++EXPORT_SYMBOL(fsync_index);
++fsync_data fsync_array[4000000];
++EXPORT_SYMBOL(fsync_array);
++#endif
++
+ #ifdef CONFIG_JBD2_DEBUG
+ void __jbd2_debug(int level, const char *file, const char *func,
+ 		  unsigned int line, const char *fmt, ...)
+@@ -457,7 +479,11 @@ int jbd2_journal_write_metadata_buffer(transaction_t *transaction,
+ 				  struct buffer_head **bh_out,
+ 				  sector_t blocknr)
+ {
+-	int need_copy_out = 1; /* CJFS - PSP */
++#ifdef PSP
++	int need_copy_out = 1;
++#elif
++	int need_copy_out = 0;
++#endif
+ 	int done_copy_out = 0;
+ 	int do_escape = 0;
+ 	char *mapped_data;
+@@ -1371,6 +1397,90 @@ static int jbd2_seq_info_release(struct inode *inode, struct file *file)
+ 	return seq_release(inode, file);
+ }
+ 
++#ifdef DEBUG_PROC_OP                                                 
++static int jbd2_op_show(struct seq_file *seq, void *v)         
++{                                                              
++        static int cnt = 0;                                    
++        int end = atomic_read(&op_index);                      
++        int i = 0;                                             
++                                                               
++        for (i = 0; i < 100; i++) {                            
++                seq_printf(seq,"%d %d %llu\n",                 
++                        end,                                   
++                        cnt,                                   
++                        op_array[cnt].op_intv[0]);             
++                                                               
++                op_array[cnt].op_intv[0] = 0;                  
++                cnt++;                                         
++                                                               
++                if (cnt == end || cnt >= 4000000 || end == 0) {
++                        seq_printf(seq, "END\n");              
++                        cnt = 0;                               
++                        break;                                 
++		}
++	}
++	return 0;
++}
++
++static int jbd2_op_release(struct inode *inode, struct file *file)
++{                                                                 
++        return single_release(inode,file);                        
++}                                                                 
++                                                                  
++static int jbd2_op_open(struct inode *inode, struct file *file)   
++{                                                                 
++        return single_open(file, jbd2_op_show, pde_data(inode));    
++}                                                                 
++                                                                  
++static const struct proc_ops jbd2_op_proc_ops = {              
++        .proc_open 	= jbd2_op_open,                           
++        .proc_read      = seq_read,                               
++        .proc_lseek     = seq_lseek,                              
++        .proc_release   = jbd2_op_release,                        
++};                                                                
++
++static int jbd2_fsync_show(struct seq_file *seq, void *v)         
++{                                                              
++        static int cnt = 0;                                    
++        int end = atomic_read(&fsync_index);                      
++        int i = 0;                                             
++                                                               
++        for (i = 0; i < 100; i++) {                            
++                seq_printf(seq,"%d %d %llu\n",                 
++                        end,                                   
++                        cnt,                                   
++                        fsync_array[cnt].fsync_intv[0]);             
++                                                               
++                fsync_array[cnt].fsync_intv[0] = 0;                  
++                cnt++;                                         
++                                                               
++                if (cnt == end || cnt >= 4000000 || end == 0) {
++                        seq_printf(seq, "END\n");              
++                        cnt = 0;                               
++                        break;                                 
++		}
++	}
++	return 0;
++}
++
++static int jbd2_fsync_release(struct inode *inode, struct file *file)
++{                                                                 
++        return single_release(inode,file);                        
++}                                                                 
++                                                                  
++static int jbd2_fsync_open(struct inode *inode, struct file *file)   
++{                                                                 
++        return single_open(file, jbd2_fsync_show, pde_data(inode));    
++}                                                                 
++                                                                  
++static const struct proc_ops jbd2_fsync_proc_ops = {              
++        .proc_open 	= jbd2_fsync_open,                           
++        .proc_read      = seq_read,                               
++        .proc_lseek     = seq_lseek,                              
++        .proc_release   = jbd2_fsync_release,                        
++};                                                                
++#endif                                                            
++
+ static const struct proc_ops jbd2_info_proc_ops = {
+ 	.proc_open	= jbd2_seq_info_open,
+ 	.proc_read	= seq_read,
+@@ -1386,12 +1496,22 @@ static void jbd2_stats_proc_init(journal_t *journal)
+ 	if (journal->j_proc_entry) {
+ 		proc_create_data("info", S_IRUGO, journal->j_proc_entry,
+ 				 &jbd2_info_proc_ops, journal);
++#ifdef DEBUG_PROC_OP
++		proc_create_data("op", S_IRUGO, journal->j_proc_entry,
++				 &jbd2_op_proc_ops, journal);
++		proc_create_data("fsync", S_IRUGO, journal->j_proc_entry,
++				 &jbd2_fsync_proc_ops, journal);
++#endif
+ 	}
+ }
+ 
+ static void jbd2_stats_proc_exit(journal_t *journal)
+ {
+ 	remove_proc_entry("info", journal->j_proc_entry);
++#ifdef DEBUG_PROC_OP	
++	remove_proc_entry("info", journal->j_proc_entry);
++	remove_proc_entry("info", journal->j_proc_entry);
++#endif
+ 	remove_proc_entry(journal->j_devname, proc_jbd2_stats);
+ }
+ 
+@@ -1545,6 +1665,10 @@ static journal_t *journal_init_common(struct block_device *bdev,
+ 		percpu_counter_destroy(&journal->j_checkpoint_jh_count);
+ 		goto err_cleanup;
+ 	}
++#ifdef DEBUG_PROC_OP
++	atomic_set(&op_index, 0);
++	atomic_set(&fsync_index, 0);
++#endif
+ 	return journal;
+ 
+ err_cleanup:
+diff --git a/kernels/5_18_18_barrier/include/linux/journal-head.h b/kernels/5_18_18_barrier/include/linux/journal-head.h
+index e3db8ac..50d0a60 100644
+--- a/kernels/5_18_18_barrier/include/linux/journal-head.h
++++ b/kernels/5_18_18_barrier/include/linux/journal-head.h
+@@ -11,9 +11,12 @@
+ #ifndef JOURNAL_HEAD_H_INCLUDED
+ #define JOURNAL_HEAD_H_INCLUDED
+ 
++/* CJFS */
+ #define OP_COALESCING 1
+ #define	MAX_JH_VERSION	5	
+ #define COMPOUND_FLUSH 5 	
++#define PSP 
++#define DEBUG_PROC_OP
+ 
+ #include <linux/spinlock.h>
+ 

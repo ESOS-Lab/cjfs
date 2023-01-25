@@ -1,0 +1,323 @@
+diff --git a/kernels/5_18_18_barrier/fs/jbd2/commit.c b/kernels/5_18_18_barrier/fs/jbd2/commit.c
+index e96e431..6ea19a8 100644
+--- a/kernels/5_18_18_barrier/fs/jbd2/commit.c
++++ b/kernels/5_18_18_barrier/fs/jbd2/commit.c
+@@ -1225,7 +1225,7 @@ void jbd2_journal_commit_transaction(journal_t *journal)
+ 
+ #ifdef DEBUG_PROC_OP
+ typedef struct {
+-	s64 op_intv[1];
++	s64 op_intv[2];
+ } op_data; 
+ extern op_data op_array[4000000];
+ extern atomic_t op_index;
+@@ -1280,12 +1280,14 @@ void jbd2_journal_barrier_commit_transaction(journal_t *journal)
+ 	LIST_HEAD(t_log_bufs);
+ 	/* CJFS */
+ 	int ver_tid;
+-	ktime_t start;
++	ktime_t start, dispatch_start;
+ 	int seq;
+ 
+ 	if (jbd2_journal_has_csum_v2or3(journal))
+ 		csum_size = sizeof(struct jbd2_journal_block_tail);
+ 
++	commit_transaction->t_commit_start_time = ktime_get();
++
+ 	/*
+ 	 * First job: lock down the current transaction and wait for
+ 	 * all outstanding updates to complete.
+@@ -1339,7 +1341,7 @@ void jbd2_journal_barrier_commit_transaction(journal_t *journal)
+ 	commit_transaction = journal->j_running_transaction;
+ 	ver_tid = commit_transaction->t_tid % MAX_JH_VERSION;
+ 
+-	commit_transaction->t_commit_start_time = ktime_get();
++	// commit_transaction->t_commit_start_time = ktime_get();
+ 
+ #ifdef OP_COALESCING
+ op_coalescing:
+@@ -1409,10 +1411,10 @@ void jbd2_journal_barrier_commit_transaction(journal_t *journal)
+ 	write_lock(&journal->j_state_lock);
+ #endif
+ #ifdef DEBUG_PROC_OP
+-	seq = atomic_add_return(1, &op_index);
+-	op_array[seq - 1].op_intv[0] = ktime_to_ns(ktime_sub(ktime_get(),start));
+-	seq = atomic_add_return(1, &cc_index);
+-	cc_array[seq - 1].cc_intv[0] = atomic_read(&commit_transaction->t_pconflict_count);
++	// seq = atomic_add_return(1, &op_index);
++	// op_array[seq - 1].op_intv[0] = ktime_to_ns(ktime_sub(ktime_get(),start));
++	// seq = atomic_add_return(1, &cc_index);
++	// cc_array[seq - 1].cc_intv[0] = atomic_read(&commit_transaction->t_pconflict_count);
+ #endif
+ 
+ 	/*
+@@ -1490,6 +1492,7 @@ void jbd2_journal_barrier_commit_transaction(journal_t *journal)
+ 	commit_transaction->t_state = T_FLUSH;
+ 	journal->j_committing_transaction = commit_transaction;
+ 	journal->j_running_transaction = NULL;
++	commit_transaction->t_commit_start_time = ktime_get();
+ 	commit_transaction->t_log_start = journal->j_head;
+ 	wake_up(&journal->j_wait_transaction_locked);
+ 	write_unlock(&journal->j_state_lock);
+@@ -1532,6 +1535,7 @@ void jbd2_journal_barrier_commit_transaction(journal_t *journal)
+ 	err = 0;
+ 	bufs = 0;
+ 	descriptor = NULL;
++	dispatch_start = ktime_get();
+ 	while (commit_transaction->t_buffers) {
+ 
+ 		/* Find the next buffer to be journaled... */
+@@ -1619,8 +1623,11 @@ void jbd2_journal_barrier_commit_transaction(journal_t *journal)
+ 		 */
+ 		set_bit(BH_JWrite, &jh2bh(jh)->b_state);
+ 		JBUFFER_TRACE(jh, "ph3: write metadata");
++		// seq = atomic_add_return(1, &op_index);
++		start = ktime_get();
+ 		flags = jbd2_journal_write_metadata_buffer(commit_transaction,
+ 						jh, &wbuf[bufs], blocknr);
++		// op_array[seq - 1].op_intv[0] = ktime_to_ns(ktime_sub(ktime_get(),start));
+ 		if (flags < 0) {
+ 			jbd2_journal_abort(journal, flags);
+ 			continue;
+@@ -1708,6 +1715,10 @@ void jbd2_journal_barrier_commit_transaction(journal_t *journal)
+ 		}
+ 	}
+ 
++#ifdef DEBUG_PROC_OP
++	op_array[seq - 1].op_intv[1] = ktime_to_ns(ktime_sub(ktime_get(), dispatch_start));
++#endif
++
+ 	err = journal_finish_inode_data_buffers(journal, commit_transaction);
+ 	if (err) {
+ 		printk(KERN_WARNING
+@@ -2015,7 +2026,8 @@ void jbd2_journal_barrier_flush_transaction(journal_t *journal)
+ #ifdef COMPOUND_FLUSH
+ 	//printk(KERN_INFO "[SWDBG] (%s) tid : %d, flush_tid : %d, commit_emtpy : %d\n"
+ 	//	,__func__, commit_transaction->t_tid, flush_tid, commit_empty);
+-	if ((journal->j_flags & JBD2_BARRIER) && (flush_tid == 0 || commit_empty == 1)) {
++	if ((journal->j_flags & JBD2_BARRIER) 
++		&& (flush_tid == 0 || commit_empty == 1)) {
+ 		blkdev_issue_flush(journal->j_dev);
+ 		// printk(KERN_INFO "[SWDBG] (%s) tid : %d, wait on flush ! flush_tid : %d, commit_emtpy : %d\n"
+ 		//	,__func__, commit_transaction->t_tid, flush_tid, commit_empty);
+diff --git a/kernels/5_18_18_barrier/fs/jbd2/journal.c b/kernels/5_18_18_barrier/fs/jbd2/journal.c
+index 61f4984..f7aa1e5 100644
+--- a/kernels/5_18_18_barrier/fs/jbd2/journal.c
++++ b/kernels/5_18_18_barrier/fs/jbd2/journal.c
+@@ -101,9 +101,9 @@
+ static int jbd2_journal_create_slab(size_t slab_size);
+ 
+ #ifdef DEBUG_PROC_OP
+-/* Tx Lock-Up Interval */
++/* Tx Lock-Up Interval && dispatch time */
+ typedef struct {
+-	s64 op_intv[1];
++	s64 op_intv[2];
+ } op_data;
+ 
+ atomic_t op_index;
+@@ -491,7 +491,7 @@ int jbd2_journal_write_metadata_buffer(transaction_t *transaction,
+ {
+ #ifdef PSP
+ 	int need_copy_out = 1;
+-#elif
++#else
+ 	int need_copy_out = 0;
+ #endif
+ 	int done_copy_out = 0;
+@@ -865,6 +865,7 @@ int jbd2_log_wait_commit(journal_t *journal, tid_t tid)
+ 				  tid, journal->j_flush_sequence);
+ 		read_unlock(&journal->j_state_lock);
+ 		wake_up(&journal->j_wait_commit);
++		wake_up(&journal->j_wait_flush);
+ 		wait_event(journal->j_wait_done_flush,
+ 				!tid_gt(tid, journal->j_flush_sequence));
+ 		read_lock(&journal->j_state_lock);
+@@ -995,8 +996,13 @@ int jbd2_complete_transaction(journal_t *journal, tid_t tid)
+ 			goto wait_commit;
+ 		}
+ 	} else if (!(journal->j_committing_transaction &&
+-		     journal->j_committing_transaction->t_tid == tid))
+-		need_to_wait = 0;
++		     journal->j_committing_transaction->t_tid == tid)) {
++		if (tid_geq(journal->j_flush_sequence, tid))
++                        need_to_wait = 0;
++                else    
++                        wake_up(&journal->j_wait_flush);
++                // need_to_wait = 0;
++	}
+ 	read_unlock(&journal->j_state_lock);
+ 	if (!need_to_wait)
+ 		return 0;
+diff --git a/kernels/5_18_18_barrier/include/linux/journal-head.h b/kernels/5_18_18_barrier/include/linux/journal-head.h
+index 1bec868..be79c13 100644
+--- a/kernels/5_18_18_barrier/include/linux/journal-head.h
++++ b/kernels/5_18_18_barrier/include/linux/journal-head.h
+@@ -13,8 +13,8 @@
+ 
+ /* CJFS */
+ #define OP_COALESCING 1 
+-#define	MAX_JH_VERSION	5	
+-#define COMPOUND_FLUSH 5	
++#define MAX_JH_VERSION 5
++#define COMPOUND_FLUSH 5
+ #define PSP 
+ #define DEBUG_PROC_OP
+ 
+diff --git a/kernels/5_18_18_barrier/include/linux/sched.h b/kernels/5_18_18_barrier/include/linux/sched.h
+index 432ceed..15066f5 100644
+--- a/kernels/5_18_18_barrier/include/linux/sched.h
++++ b/kernels/5_18_18_barrier/include/linux/sched.h
+@@ -1504,7 +1504,7 @@ struct task_struct {
+ 	unsigned int barrier_fail;
+ 	unsigned int epoch_fail;  
+ 	unsigned int tx_id;       
+-	s64 op_intv[1];           
++	s64 op_intv[2];           
+ 	ktime_t start;            
+ 	void *tx;                 
+ 	
+diff --git a/kernels/5_18_18_original/fs/jbd2/commit.c b/kernels/5_18_18_original/fs/jbd2/commit.c
+index cabb1d0..fd47378 100644
+--- a/kernels/5_18_18_original/fs/jbd2/commit.c
++++ b/kernels/5_18_18_original/fs/jbd2/commit.c
+@@ -375,7 +375,7 @@ static void jbd2_block_tag_csum_set(journal_t *j, journal_block_tag_t *tag,
+ 
+ #ifdef DEBUG_PROC_OP             
+ typedef struct {                 
+-       s64 op_intv[1];           
++       s64 op_intv[2];           
+ } op_data;                       
+ extern op_data op_array[4000000];
+ extern atomic_t op_index;        
+@@ -423,7 +423,7 @@ void jbd2_journal_commit_transaction(journal_t *journal)
+ 	int csum_size = 0;
+ 	LIST_HEAD(io_bufs);
+ 	LIST_HEAD(log_bufs);
+-        ktime_t start;
++        ktime_t start, dispatch_start;
+         int seq;      
+ 
+ 	if (jbd2_journal_has_csum_v2or3(journal))
+@@ -511,10 +511,10 @@ void jbd2_journal_commit_transaction(journal_t *journal)
+ 	J_ASSERT (atomic_read(&commit_transaction->t_outstanding_credits) <=
+ 			journal->j_max_transaction_buffers);
+ #ifdef DEBUG_PROC_OP                                                            
+-        seq = atomic_add_return(1, &op_index);                                   
+-        op_array[seq - 1].op_intv[0] = ktime_to_ns(ktime_sub(ktime_get(),start));
+-        seq = atomic_add_return(1, &cc_index);                                   
+-        cc_array[seq - 1].cc_intv[0] = atomic_read(&commit_transaction->t_pconflict_count);
++        // seq = atomic_add_return(1, &op_index);                                   
++        // op_array[seq - 1].op_intv[0] = ktime_to_ns(ktime_sub(ktime_get(),start));
++        // seq = atomic_add_return(1, &cc_index);                                   
++        // cc_array[seq - 1].cc_intv[0] = atomic_read(&commit_transaction->t_pconflict_count);
+ #endif                                                                          
+ 
+ 
+@@ -634,6 +634,7 @@ void jbd2_journal_commit_transaction(journal_t *journal)
+ 	err = 0;
+ 	bufs = 0;
+ 	descriptor = NULL;
++	dispatch_start = ktime_get();
+ 	while (commit_transaction->t_buffers) {
+ 
+ 		/* Find the next buffer to be journaled... */
+@@ -721,8 +722,11 @@ void jbd2_journal_commit_transaction(journal_t *journal)
+ 		 */
+ 		set_bit(BH_JWrite, &jh2bh(jh)->b_state);
+ 		JBUFFER_TRACE(jh, "ph3: write metadata");
++        	seq = atomic_add_return(1, &op_index);                                   
++		start = ktime_get();
+ 		flags = jbd2_journal_write_metadata_buffer(commit_transaction,
+ 						jh, &wbuf[bufs], blocknr);
++        	op_array[seq - 1].op_intv[0] = ktime_to_ns(ktime_sub(ktime_get(),start));
+ 		if (flags < 0) {
+ 			jbd2_journal_abort(journal, flags);
+ 			continue;
+@@ -797,6 +801,9 @@ void jbd2_journal_commit_transaction(journal_t *journal)
+ 			bufs = 0;
+ 		}
+ 	}
++#ifdef DEBUG_PROC_OP                                                            
++        op_array[seq - 1].op_intv[1] = ktime_to_ns(ktime_sub(ktime_get(),dispatch_start));
++#endif                                                                          
+ 
+ 	err = journal_finish_inode_data_buffers(journal, commit_transaction);
+ 	if (err) {
+diff --git a/kernels/5_18_18_original/fs/jbd2/journal.c b/kernels/5_18_18_original/fs/jbd2/journal.c
+index 6f24b2b..5024662 100644
+--- a/kernels/5_18_18_original/fs/jbd2/journal.c
++++ b/kernels/5_18_18_original/fs/jbd2/journal.c
+@@ -101,9 +101,9 @@
+ static int jbd2_journal_create_slab(size_t slab_size);
+ 
+ #ifdef DEBUG_PROC_OP            
+-/* Tx Lock-Up Interval */       
++/* Tx Lock-Up Interval && Dispatch Interval */       
+ typedef struct {                
+-       s64 op_intv[1];          
++       s64 op_intv[2];          
+ } op_data;                      
+                                 
+ atomic_t op_index;              
+@@ -130,6 +130,9 @@
+ EXPORT_SYMBOL(fsync_index);     
+ fsync_data fsync_array[4000000];
+ EXPORT_SYMBOL(fsync_array);     
++
++atomic_t num_of_access;
++atomic_t num_of_conflict;
+ #endif                          
+ 
+ 
+@@ -1229,6 +1232,10 @@ static int jbd2_seq_info_show(struct seq_file *seq, void *v)
+ 	    s->stats->run.rs_blocks / s->stats->ts_tid);
+ 	seq_printf(seq, "  %lu logged blocks per transaction\n",
+ 	    s->stats->run.rs_blocks_logged / s->stats->ts_tid);
++	seq_printf(seq, "  # of access %lu\n",
++	    atomic_read(&num_of_access));
++	seq_printf(seq, "  # of conflit %lu\n",
++	    atomic_read(&num_of_conflict));
+ 	return 0;
+ }
+ 
+@@ -1597,6 +1604,8 @@ static journal_t *journal_init_common(struct block_device *bdev,
+         atomic_set(&op_index, 0);   
+         atomic_set(&fsync_index, 0);
+         atomic_set(&cc_index, 0);
++	atomic_set(&num_of_access, 0);
++	atomic_set(&num_of_conflict, 0);
+ #endif                             
+ 	return journal;
+ 
+diff --git a/kernels/5_18_18_original/fs/jbd2/transaction.c b/kernels/5_18_18_original/fs/jbd2/transaction.c
+index 83ea218..4cc4dbc 100644
+--- a/kernels/5_18_18_original/fs/jbd2/transaction.c
++++ b/kernels/5_18_18_original/fs/jbd2/transaction.c
+@@ -967,6 +967,8 @@ static void jbd2_freeze_jh_data(struct journal_head *jh)
+  * part of the transaction, that is).
+  *
+  */
++extern atomic_t num_of_access;
++extern atomic_t num_of_conflict;
+ static int
+ do_get_write_access(handle_t *handle, struct journal_head *jh,
+ 			int force_copy)
+@@ -977,6 +979,9 @@ static void jbd2_freeze_jh_data(struct journal_head *jh)
+ 	int error;
+ 	char *frozen_buffer = NULL;
+ 	unsigned long start_lock, time_lock;
++	
++	/* CJFS */
++	atomic_inc(&num_of_access);
+ 
+ 	journal = transaction->t_journal;
+ 
+@@ -1107,6 +1112,7 @@ static void jbd2_freeze_jh_data(struct journal_head *jh)
+ 		spin_unlock(&jh->b_state_lock);
+ 		wait_on_bit_io(&bh->b_state, BH_Shadow, TASK_UNINTERRUPTIBLE);
+ 		atomic_inc(&transaction->t_pconflict_count);
++		atomic_inc(&num_of_conflict);
+ 		goto repeat;
+ 	}
+ 

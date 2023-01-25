@@ -1,0 +1,56 @@
+diff --git a/kernels/5_18_18_barrier/fs/jbd2/commit.c b/kernels/5_18_18_barrier/fs/jbd2/commit.c
+index cdf2c4a..f41fb26 100644
+--- a/kernels/5_18_18_barrier/fs/jbd2/commit.c
++++ b/kernels/5_18_18_barrier/fs/jbd2/commit.c
+@@ -1164,7 +1164,13 @@ void jbd2_journal_commit_transaction(journal_t *journal)
+ 
+ 	commit_transaction->t_state = T_COMMIT_CALLBACK;
+ 	J_ASSERT(commit_transaction == journal->j_committing_transaction);
++#ifdef FLUSH_COMPOUND
++	if (flush_tid == 0 || commit_empty == 1) {
++		journal->j_commit_sequence = commit_transaction->t_tid;
++	}
++#else
+ 	journal->j_commit_sequence = commit_transaction->t_tid;
++#endif
+ 	journal->j_committing_transaction = NULL;
+ 	commit_time = ktime_to_ns(ktime_sub(ktime_get(), start_time));
+ 
+@@ -1848,7 +1854,8 @@ void jbd2_journal_barrier_commit_transaction(journal_t *journal)
+ 	commit_transaction->stats.ts_requested = (commit_transaction->t_requested) ? 1 : 0;
+ 
+ 	J_ASSERT(commit_transaction == journal->j_committing_transaction);
+-	journal->j_commit_sequence = commit_transaction->t_tid;
++	/* CJFS */
++	// journal->j_commit_sequence = commit_transaction->t_tid;
+ 	journal->j_committing_transaction = NULL;
+ 	// commit_time = ktime_to_ns(ktime_sub(ktime_get(), commit_transaction->start_time));
+ 
+diff --git a/kernels/5_18_18_barrier/fs/jbd2/journal.c b/kernels/5_18_18_barrier/fs/jbd2/journal.c
+index 939fcfe..e238592 100644
+--- a/kernels/5_18_18_barrier/fs/jbd2/journal.c
++++ b/kernels/5_18_18_barrier/fs/jbd2/journal.c
+@@ -994,8 +994,8 @@ int jbd2_complete_transaction(journal_t *journal, tid_t tid)
+ 			jbd2_log_start_commit(journal, tid);
+ 			goto wait_commit;
+ 		}
+-	} else if (!(journal->j_committing_transaction &&
+-		     journal->j_committing_transaction->t_tid == tid))
++	/* CJFS */
++	} else if (tid_geq(journal->j_commit_sequence, tid))
+ 		need_to_wait = 0;
+ 	read_unlock(&journal->j_state_lock);
+ 	if (!need_to_wait)
+diff --git a/kernels/5_18_18_barrier/include/linux/journal-head.h b/kernels/5_18_18_barrier/include/linux/journal-head.h
+index 1bec868..128bf17 100644
+--- a/kernels/5_18_18_barrier/include/linux/journal-head.h
++++ b/kernels/5_18_18_barrier/include/linux/journal-head.h
+@@ -13,7 +13,7 @@
+ 
+ /* CJFS */
+ #define OP_COALESCING 1 
+-#define	MAX_JH_VERSION	5	
++#define	MAX_JH_VERSION	5
+ #define COMPOUND_FLUSH 5	
+ #define PSP 
+ #define DEBUG_PROC_OP

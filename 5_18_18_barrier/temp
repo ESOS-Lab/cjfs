@@ -1,0 +1,60 @@
+diff --git a/kernels/5_18_18_barrier/fs/jbd2/commit.c b/kernels/5_18_18_barrier/fs/jbd2/commit.c
+index cdf2c4a..e96e431 100644
+--- a/kernels/5_18_18_barrier/fs/jbd2/commit.c
++++ b/kernels/5_18_18_barrier/fs/jbd2/commit.c
+@@ -2202,6 +2202,12 @@ void jbd2_journal_barrier_flush_transaction(journal_t *journal)
+ 		write_unlock(&journal->j_state_lock);
+ 		goto restart_loop;
+ 	}
++#ifdef COMPOUND_FLUSH	
++	if (flush_tid == 0 || commit_empty == 1) 
++		journal->j_flush_sequence = commit_transaction->t_tid;
++#else
++	journal->j_flush_sequence = commit_transaction->t_tid;
++#endif
+ 
+ 	/* Add the transaction to the checkpoint list
+ 	 * __journal_remove_checkpoint() can not destroy transaction
+diff --git a/kernels/5_18_18_barrier/fs/jbd2/journal.c b/kernels/5_18_18_barrier/fs/jbd2/journal.c
+index 939fcfe..61f4984 100644
+--- a/kernels/5_18_18_barrier/fs/jbd2/journal.c
++++ b/kernels/5_18_18_barrier/fs/jbd2/journal.c
+@@ -860,13 +860,13 @@ int jbd2_log_wait_commit(journal_t *journal, tid_t tid)
+ 		       __func__, journal->j_commit_request, tid);
+ 	}
+ #endif
+-	while (tid_gt(tid, journal->j_commit_sequence)) {
+-		jbd_debug(1, "JBD2: want %u, j_commit_sequence=%u\n",
+-				  tid, journal->j_commit_sequence);
++	while (tid_gt(tid, journal->j_flush_sequence)) {
++		jbd_debug(1, "JBD2: want %u, j_flush_sequence=%u\n",
++				  tid, journal->j_flush_sequence);
+ 		read_unlock(&journal->j_state_lock);
+ 		wake_up(&journal->j_wait_commit);
+ 		wait_event(journal->j_wait_done_flush,
+-				!tid_gt(tid, journal->j_commit_sequence));
++				!tid_gt(tid, journal->j_flush_sequence));
+ 		read_lock(&journal->j_state_lock);
+ 	}
+ 	read_unlock(&journal->j_state_lock);
+@@ -1861,6 +1861,8 @@ static int journal_reset(journal_t *journal)
+ 	journal->j_tail_sequence = journal->j_transaction_sequence;
+ 	journal->j_commit_sequence = journal->j_transaction_sequence - 1;
+ 	journal->j_commit_request = journal->j_commit_sequence;
++	
++	journal->j_flush_sequence = journal->j_commit_sequence - 1;
+ 
+ 	journal->j_max_transaction_buffers = jbd2_journal_get_max_txn_bufs(journal);
+ 
+diff --git a/kernels/5_18_18_barrier/include/linux/jbd2.h b/kernels/5_18_18_barrier/include/linux/jbd2.h
+index fb1ca24..37b779a 100644
+--- a/kernels/5_18_18_barrier/include/linux/jbd2.h
++++ b/kernels/5_18_18_barrier/include/linux/jbd2.h
+@@ -1150,6 +1150,7 @@ struct journal_s
+ 	 * [j_state_lock, no lock for quick racy checks]
+ 	 */
+ 	tid_t			j_commit_sequence;
++	tid_t			j_flush_sequence;
+ 
+ 	/**
+ 	 * @j_commit_request:
