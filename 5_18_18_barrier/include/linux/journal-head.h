@@ -12,8 +12,8 @@
 #define JOURNAL_HEAD_H_INCLUDED
 
 /* CJFS */
-#define OP_COALESCING 1 
-#define MAX_JH_VERSION 1
+// #define OP_COALESCING 1 
+#define MAX_JH_VERSION 5
 // #define COMPOUND_FLUSH 5
 // #define PSP 
 // #define DEBUG_PROC_OP

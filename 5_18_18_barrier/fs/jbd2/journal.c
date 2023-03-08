@@ -342,7 +342,6 @@ end_loop:
 static int kjournald2flush(void *arg)
 {
 	journal_t *journal = arg;
-	//transaction_t *transaction;
 
 	set_freezable();
 
