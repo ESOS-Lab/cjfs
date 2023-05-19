@@ -113,7 +113,17 @@ static int ext4_fsync_journal(struct inode *inode, bool datasync,
 	    !jbd2_trans_will_send_data_barrier(journal, commit_tid))
 		*needs_barrier = true;
 
-	return ext4_fc_commit(journal, commit_tid);
+	return jbd2_complete_transaction(journal, commit_tid);
+}
+
+static int ext4_fbarrier_journal(struct inode *inode, bool datasync,
+			     bool *needs_barrier)
+{
+	struct ext4_inode_info *ei = EXT4_I(inode);
+	journal_t *journal = EXT4_SB(inode->i_sb)->s_journal;
+	tid_t commit_tid = datasync ? ei->i_datasync_tid : ei->i_sync_tid;
+
+	return jbd2_dispatch_transaction(journal, commit_tid);
 }
 
 /*
@@ -141,13 +151,13 @@ int ext4_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
 	bool needs_barrier = false;
 	struct inode *inode = file->f_mapping->host;
 	struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
-	struct ext4_inode_info *ei = EXT4_I(inode);
+	// struct ext4_inode_info *ei = EXT4_I(inode);
 	
 	/* CJFS debug */
-	journal_t *journal = EXT4_SB(inode->i_sb)->s_journal;
+	// journal_t *journal = EXT4_SB(inode->i_sb)->s_journal;
 	
 #ifdef DEBUG_FSYNC_LATENCY
-	ktime_t start1, end1;
+	ktime_t start1;
 	fsync_data temp;
 	int j = 0, seq = 0;
 
@@ -172,20 +182,19 @@ int ext4_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
 		goto out;
 	}
 
-	/* UFS */
-	// trace_ext4_sync_file_data_start(inode, datasync);
-	//printk(KERN_INFO "[SWDBG] (%s) sync_start! pid : %d, tid : %d\n"
-	//	,__func__,task_pid(current),commit_tid); 
-	
 	if (datasync)
 		ret = file_write_and_wait_range(file, start, end);
-	else
-		ret = filemap_write_and_dispatch_range(file->f_mapping, start, end);
+	else {
+#ifdef DEBUG_FSYNC_LATENCY
+		ret = filemap_fdatawrite_range(file->f_mapping, start, end);
+		temp.fsync_intv[0] = ktime_sub(ktime_get(), start1); 
+		filemap_fdatadispatch_range(file->f_mapping, start, end);
+		temp.fsync_intv[1] = ktime_sub(ktime_get(), start1); 
+#endif
+	}
 	if (ret)
 		goto out;
 	
-	// trace_ext4_sync_file_data_complete(inode, datasync);
-
 	/*
 	 * data=writeback,ordered:
 	 *  The caller's filemap_fdatawrite()/wait will sync the data.
@@ -200,50 +209,38 @@ int ext4_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
 	 *  (they were dirtied by commit).  But that's OK - the blocks are
 	 *  safe in-journal, which is all fsync() needs to ensure.
 	 */
-#ifdef DEBUG_FSYNC_LATENCY
-	//read_lock(&journal->j_state_lock);
-	//spin_lock(&journal->j_list_lock);
-	temp.fsync_intv[1] = 0; // journal->j_commit_sequence;
-	temp.fsync_intv[2] = 0; // journal->j_transfer_sequence;
-	temp.fsync_intv[3] = 0; // journal->j_flush_sequence;
-	//spin_unlock(&journal->j_list_lock);
-	//read_unlock(&journal->j_state_lock);
-	temp.fsync_intv[4] = 0; // datasync ? ei->i_datasync_tid : ei->i_sync_tid; 
-#endif
 	if (!sbi->s_journal)
 		ret = ext4_fsync_nojournal(inode, datasync, &needs_barrier);
 	else if (ext4_should_journal_data(inode))
 		ret = ext4_force_commit(inode->i_sb);
-	else /* Need to be modified after Dual Mode Journaling is ported */
+	else 
 		ret = ext4_fsync_journal(inode, datasync, &needs_barrier);
+#ifdef DEBUG_FSYNC_LATENCY
+		temp.fsync_intv[2] = ktime_sub(ktime_get(), start1); 
+#endif
 
 	if (needs_barrier) {
 		err = blkdev_issue_flush(inode->i_sb->s_bdev);
 		if (!ret)
 			ret = err;
 	}
+#ifdef DEBUG_FSYNC_LATENCY
+	temp.fsync_intv[3] = ktime_sub(ktime_get(), start1); 
+#endif
 	
-	// commit_tid = datasync ? ei->i_datasync_tid : ei->i_sync_tid;
-	//printk(KERN_INFO "[SWDBG] (%s) sync_end! pid : %d, tid : %d\n"
-	//	,__func__,task_pid(current),commit_tid); 
 out:
 	err = file_check_and_advance_wb_err(file);
 	if (ret == 0)
 		ret = err;
 	trace_ext4_sync_file_exit(inode, ret);
 #ifdef DEBUG_FSYNC_LATENCY
-	end1 = ktime_get();
+	temp.fsync_intv[4] = ktime_sub(ktime_get(), start1); 
 	seq = atomic_add_return(1, &fsync_index);
 	if (seq >= 4000000)
 		return ret;
-	temp.fsync_intv[0] += ktime_to_ns(ktime_sub(end1,start1));
-	for (j = 0; j < 1; j++) {                                  
+	for (j = 0; j < 5; j++) {                                  
         	fsync_array[seq-1].fsync_intv[j] = temp.fsync_intv[j];
 	}                                                      
-        fsync_array[seq-1].fsync_intv[1] = temp.fsync_intv[1];
-        fsync_array[seq-1].fsync_intv[2] = temp.fsync_intv[2];
-        fsync_array[seq-1].fsync_intv[3] = temp.fsync_intv[3];
-        fsync_array[seq-1].fsync_intv[4] = temp.fsync_intv[4];
 #endif
 	return ret;
 }
@@ -251,10 +248,21 @@ out:
 /* UFS */
 int ext4_fbarrier_file(struct file *file, loff_t start, loff_t end, int datasync)
 {
-	int ret = 0, err;
+	int ret = 0;
 	bool needs_barrier = false;
 	struct inode *inode = file->f_mapping->host;
 	struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
+
+#ifdef DEBUG_FSYNC_LATENCY
+	ktime_t start1;
+	fsync_data temp;
+	int j = 0, seq = 0;
+
+	for (j = 0; j < 5; j++) {
+		temp.fsync_intv[j] = 0;
+	}
+	start1 = ktime_get();
+#endif
 
 	if (unlikely(ext4_forced_shutdown(sbi)))
 		return -EIO;
@@ -271,15 +279,12 @@ int ext4_fbarrier_file(struct file *file, loff_t start, loff_t end, int datasync
 		goto out;
 	}
 
-	if (datasync) {
-		current->barrier_fail = 0;
-		ret = filemap_ordered_write_range(file->f_mapping, start, end);
-		if (current->barrier_fail)
-			needs_barrier = true;
+#ifdef DEBUG_FSYNC_LATENCY
+	ret = filemap_fdatawrite_range(file->f_mapping, start, end);
+	temp.fsync_intv[0] = ktime_sub(ktime_get(), start1); 
 		filemap_fdatadispatch_range(file->f_mapping, start, end);
-	}
-	else
-		ret = filemap_write_and_dispatch_range(file->f_mapping, start, end);
+	temp.fsync_intv[1] = ktime_sub(ktime_get(), start1); 
+#endif
 	if (ret)
 		goto out;
 
@@ -301,15 +306,22 @@ int ext4_fbarrier_file(struct file *file, loff_t start, loff_t end, int datasync
 		ret = ext4_fsync_nojournal(inode, datasync, &needs_barrier);
 	else if (ext4_should_journal_data(inode))
 		ret = ext4_force_commit(inode->i_sb);
-	else {/* Need to be modified after Dual Mode Journaling is ported */
-		if (datasync && needs_barrier) 
-			current->barrier_fail = 0;
-		// ret = ext4_fsync_journal(inode, datasync, &needs_barrier);
+	else {
+		ret = ext4_fbarrier_journal(inode, datasync, &needs_barrier);
 	}
+#ifdef DEBUG_FSYNC_LATENCY
+	temp.fsync_intv[2] = ktime_sub(ktime_get(), start1); 
+#endif
 out:
-	// err = file_check_and_advance_wb_err(file);
-	if (ret == 0)
-		ret = err;
 	trace_ext4_sync_file_exit(inode, ret);
+#ifdef DEBUG_FSYNC_LATENCY
+	temp.fsync_intv[3] = ktime_sub(ktime_get(), start1); 
+	seq = atomic_add_return(1, &fsync_index);
+	if (seq >= 4000000)
+		return ret;
+	for (j = 0; j < 4; j++) {                                  
+        	fsync_array[seq-1].fsync_intv[j] = temp.fsync_intv[j];
+	}                                                      
+#endif
 	return ret;
 }

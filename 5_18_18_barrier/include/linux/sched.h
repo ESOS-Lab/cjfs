@@ -1504,7 +1504,7 @@ struct task_struct {
 	unsigned int barrier_fail;
 	unsigned int epoch_fail;  
 	unsigned int tx_id;       
-	s64 op_intv[5];           
+	s64 op_intv[7];           
 	ktime_t start;            
 	void *tx;                 
 	

@@ -918,24 +918,6 @@ static blk_status_t nvme_prep_rq(struct nvme_dev *dev, struct request *req)
 	iod->npages = -1;
 	iod->nents = 0;
 	
-	/* UFS */
-	if (req->cmd_bflags & REQ_ORDERED) { 
-		struct bio *req_bio; 
-		req_bio = req->bio; 
-		while (req_bio) { 
-			struct bio *bio = req_bio;
-			if (bio->bi_epoch) {
-				struct epoch *epoch = bio->bi_epoch;
-				if (epoch->pending == 1 && epoch->barrier) {
-					req->cmd_bflags |= REQ_BARRIER;
-				}
-				epoch->pending--;
-				epoch->dispatch++;
-			}
-			req_bio = bio->bi_next;
-		}
-	}
-
 	ret = nvme_setup_cmd(req->q->queuedata, req);
 	if (ret)
 		return ret;
@@ -988,10 +970,8 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 		return ret;
 	spin_lock(&nvmeq->sq_lock);
 	nvme_sq_copy_cmd(nvmeq, &iod->cmd);
-	nvme_write_sq_db(nvmeq, bd->last);
-	/* UFS */                   
-	blk_mq_dispatch_request(req);
 	blk_request_dispatched(req);
+	nvme_write_sq_db(nvmeq, bd->last);
 	spin_unlock(&nvmeq->sq_lock);
 	return BLK_STS_OK;
 }
@@ -1007,17 +987,9 @@ static void nvme_submit_cmds(struct nvme_queue *nvmeq, struct request **rqlist)
 		
 		nvme_sq_copy_cmd(nvmeq, &iod->cmd);
 		
-		/* UFS */                   
-		if (!rq_list_empty(*rqlist)) {
-			blk_mq_dispatch_request(req);
 			blk_request_dispatched(req);
 		}
-	}
 	nvme_write_sq_db(nvmeq, true);
-
-	/* UFS */                   
-	blk_mq_dispatch_request(req);
-	blk_request_dispatched(req);
 	spin_unlock(&nvmeq->sq_lock);
 }
 

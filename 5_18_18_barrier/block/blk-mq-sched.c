@@ -132,24 +132,6 @@ static int __blk_mq_do_dispatch_sched(struct blk_mq_hw_ctx *hctx)
 			break;
 		}
 		
-		/* UFS */
-		if (rq->cmd_bflags & REQ_ORDERED) { 
-			struct bio *req_bio; 
-			req_bio = rq->bio; 
-			while (req_bio) { 
-				struct bio *bio = req_bio;
-				if (bio->bi_epoch) {
-					struct epoch *epoch = bio->bi_epoch;
-					if (epoch->pending == 1 && epoch->barrier) {
-						rq->cmd_bflags |= REQ_BARRIER;
-					}
-					epoch->pending--;
-					epoch->dispatch++;
-				}
-				req_bio = bio->bi_next;
-			}
-		}
-
 		blk_mq_set_rq_budget_token(rq, budget_token);
 
 		/*

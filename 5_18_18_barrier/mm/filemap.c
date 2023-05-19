@@ -658,6 +658,14 @@ int filemap_fdatawait_range_keep_errors(struct address_space *mapping,
 }
 EXPORT_SYMBOL(filemap_fdatawait_range_keep_errors);
 
+int filemap_fdatadispatch_range_keep_errors(struct address_space *mapping,
+		loff_t start_byte, loff_t end_byte)
+{
+	filemap_fdatadispatch_range(mapping, start_byte, end_byte);
+	return filemap_check_and_keep_errors(mapping);
+}
+EXPORT_SYMBOL(filemap_fdatadispatch_range_keep_errors);
+
 /**
  * file_fdatawait_range - wait for writeback to complete
  * @file:		file pointing to address space structure to wait for

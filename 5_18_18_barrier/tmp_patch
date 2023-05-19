@@ -1,56 +1,1369 @@
-diff --git a/kernels/5_18_18_barrier/fs/jbd2/commit.c b/kernels/5_18_18_barrier/fs/jbd2/commit.c
-index cdf2c4a..f41fb26 100644
---- a/kernels/5_18_18_barrier/fs/jbd2/commit.c
-+++ b/kernels/5_18_18_barrier/fs/jbd2/commit.c
-@@ -1164,7 +1164,13 @@ void jbd2_journal_commit_transaction(journal_t *journal)
+--- ./block/blk-core.c	2023-01-25 11:37:29.393794571 +0900
++++ /home/oslab/fast_commit/kernel/5_18_18_barrier/./block/blk-core.c	2023-05-04 14:48:45.579911881 +0900
+@@ -42,6 +42,8 @@
+ #include <linux/sched/sysctl.h>
+ #include <linux/blk-crypto.h>
  
- 	commit_transaction->t_state = T_COMMIT_CALLBACK;
- 	J_ASSERT(commit_transaction == journal->j_committing_transaction);
-+#ifdef FLUSH_COMPOUND
-+	if (flush_tid == 0 || commit_empty == 1) {
-+		journal->j_commit_sequence = commit_transaction->t_tid;
-+	}
-+#else
- 	journal->j_commit_sequence = commit_transaction->t_tid;
++#include <linux/jbd2.h>
++
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/block.h>
+ 
+@@ -1282,44 +1284,32 @@
+ {
+ 	struct bio *req_bio;
+ 	
+-	if (!req->__data_len || !(req->cmd_bflags & REQ_ORDERED))
++	if (!blk_rq_bytes(req) && (req_op(req) != REQ_OP_WRITE))
+ 		return;
+ 
+ 	req_bio = req->bio;
+ 
+ 	while (req_bio) {
+-		int i;
+ 		struct bio *bio = req_bio;
+-
+-		if (req->cmd_bflags & REQ_ORDERED) {
+-			if (bio->bi_epoch) {
+-				struct epoch *epoch;
+-				epoch = bio->bi_epoch;
+-				bio->bi_epoch = NULL;
+-				epoch->complete++;
+-				put_epoch(epoch);
+-				if (atomic_read(&epoch->e_count) < 0) {
+-					printk(KERN_INFO "[SWDBG] (%s) bio : %p next_bio : %p epoch : %p count : %d tid : %d\n"
+-					,__func__, (void *) bio, (void *) bio->bi_next, 
+-					(void *) epoch, 
+-					atomic_read(&epoch->e_count), epoch->task->pid);
+-				}
+-				if (atomic_read(&epoch->e_count) == 0)
+-					mempool_free(epoch, epoch->q->epoch_pool);
+-			}
++		dispatch_bio_bh(bio);
++		req_bio = bio->bi_next;
+ 		}
+ 
+-		for (i = bio->bi_iter.bi_idx; i < bio->bi_vcnt; i++) {                
+-			struct bio_vec *bvec = &bio->bi_io_vec[i];
+-			struct page *page = bvec->bv_page;        
+-			if (page && PageDispatch(page))                               
++	req_bio = req->bio;
++
++	while (req_bio && req_bio->bi_opf & REQ_SYNC && req_bio->bi_io_vec) {
++		struct bio *bio = req_bio;
++		struct bvec_iter iter = bio->bi_iter;
++		struct bio_vec bvl;
++
++		for (;iter.bi_size && (bvl = mp_bvec_iter_bvec((bio->bi_io_vec), iter), 1); 
++			bio_advance_iter_single(bio, &iter, PAGE_SIZE)) {
++			
++			struct page *page = bvl.bv_page + ((bvl.bv_offset) >> PAGE_SHIFT);
++			if (page) 
+ 				end_page_dispatch(page);          
+ 		}       
+ 
+-		if (dispatch_bio_bh(bio)) {
+-			req_bio = bio->bi_next;
+-			continue;              
+-		}
+ 		req_bio = bio->bi_next;        
+ 	}
+ }
+--- ./block/blk-mq-sched.c	2023-01-25 11:37:29.394794571 +0900
++++ /home/oslab/fast_commit/kernel/5_18_18_barrier/./block/blk-mq-sched.c	2023-05-05 10:49:40.607883652 +0900
+@@ -132,24 +132,6 @@
+ 			break;
+ 		}
+ 		
+-		/* UFS */
+-		if (rq->cmd_bflags & REQ_ORDERED) { 
+-			struct bio *req_bio; 
+-			req_bio = rq->bio; 
+-			while (req_bio) { 
+-				struct bio *bio = req_bio;
+-				if (bio->bi_epoch) {
+-					struct epoch *epoch = bio->bi_epoch;
+-					if (epoch->pending == 1 && epoch->barrier) {
+-						rq->cmd_bflags |= REQ_BARRIER;
+-					}
+-					epoch->pending--;
+-					epoch->dispatch++;
+-				}
+-				req_bio = bio->bi_next;
+-			}
+-		}
+-
+ 		blk_mq_set_rq_budget_token(rq, budget_token);
+ 
+ 		/*
+--- ./block/blk-mq.c	2023-01-25 11:37:29.395794571 +0900
++++ /home/oslab/fast_commit/kernel/5_18_18_barrier/./block/blk-mq.c	2023-05-03 15:29:52.622904094 +0900
+@@ -2898,23 +2898,6 @@
+ 	if (!bio_integrity_prep(bio))
+ 		return;
+ 
+-	/* UFS */
+-	if (bio->bi_opf & REQ_ORDERED) {
+-		if (!current->__epoch) {
+-			blk_start_epoch(q);
+-		}
+-	
+-		get_epoch(current->__epoch);
+-		bio->bi_epoch = current->__epoch;
+-		bio->bi_epoch->pending++;
+-		
+-		if (bio->bi_opf & REQ_BARRIER 
+-			&& ((bio->bi_end_io == bio_chain_endio && bio != parent) 
+-			     || (!bio->bi_iter.bi_idx && bio == parent))) {
+-			blk_finish_epoch();
+-		}
+-	}
+-
+ 	rq = blk_mq_get_cached_request(q, plug, &bio, nr_segs);
+ 	if (!rq) {
+ 		if (!bio)
+--- ./drivers/nvme/host/pci.c	2023-01-25 11:39:42.588788974 +0900
++++ /home/oslab/fast_commit/kernel/5_18_18_barrier/./drivers/nvme/host/pci.c	2023-05-05 10:52:21.595874207 +0900
+@@ -918,24 +918,6 @@
+ 	iod->npages = -1;
+ 	iod->nents = 0;
+ 	
+-	/* UFS */
+-	if (req->cmd_bflags & REQ_ORDERED) { 
+-		struct bio *req_bio; 
+-		req_bio = req->bio; 
+-		while (req_bio) { 
+-			struct bio *bio = req_bio;
+-			if (bio->bi_epoch) {
+-				struct epoch *epoch = bio->bi_epoch;
+-				if (epoch->pending == 1 && epoch->barrier) {
+-					req->cmd_bflags |= REQ_BARRIER;
+-				}
+-				epoch->pending--;
+-				epoch->dispatch++;
+-			}
+-			req_bio = bio->bi_next;
+-		}
+-	}
+-
+ 	ret = nvme_setup_cmd(req->q->queuedata, req);
+ 	if (ret)
+ 		return ret;
+@@ -988,10 +970,8 @@
+ 		return ret;
+ 	spin_lock(&nvmeq->sq_lock);
+ 	nvme_sq_copy_cmd(nvmeq, &iod->cmd);
+-	nvme_write_sq_db(nvmeq, bd->last);
+-	/* UFS */                   
+-	blk_mq_dispatch_request(req);
+ 	blk_request_dispatched(req);
++	nvme_write_sq_db(nvmeq, bd->last);
+ 	spin_unlock(&nvmeq->sq_lock);
+ 	return BLK_STS_OK;
+ }
+@@ -1007,17 +987,9 @@
+ 		
+ 		nvme_sq_copy_cmd(nvmeq, &iod->cmd);
+ 		
+-		/* UFS */                   
+-		if (!rq_list_empty(*rqlist)) {
+-			blk_mq_dispatch_request(req);
+ 			blk_request_dispatched(req);
+ 		}
+-	}
+ 	nvme_write_sq_db(nvmeq, true);
+-
+-	/* UFS */                   
+-	blk_mq_dispatch_request(req);
+-	blk_request_dispatched(req);
+ 	spin_unlock(&nvmeq->sq_lock);
+ }
+ 
+--- ./drivers/scsi/scsi_lib.c	2023-01-25 11:39:45.170788866 +0900
++++ /home/oslab/fast_commit/kernel/5_18_18_barrier/./drivers/scsi/scsi_lib.c	2023-05-03 20:41:07.460994147 +0900
+@@ -1751,8 +1751,6 @@
+ 
+ 	/* UFS */                   
+ 	blk_mq_dispatch_request(req);
+-	blk_request_dispatched(req);
+-
+ 	return BLK_STS_OK;
+ 
+ out_dec_host_busy:
+--- ./fs/ext4/super.c	2023-01-25 11:39:49.138788699 +0900
++++ /home/oslab/fast_commit/kernel/5_18_18_barrier/./fs/ext4/super.c	2023-05-03 20:05:49.477932801 +0900
+@@ -554,6 +554,16 @@
+ 	return ret;
+ }
+ 
++static int ext4_journal_dispatch_inode_data_buffers(struct jbd2_inode *jinode)
++{
++	int ret = 0;
++
++	if (!ext4_should_journal_data(jinode->i_vfs_inode))
++		ret = jbd2_journal_dispatch_inode_data_buffers(jinode);
++
++	return ret;
++}
++
+ static int ext4_journal_finish_inode_data_buffers(struct jbd2_inode *jinode)
+ {
+ 	int ret = 0;
+@@ -5281,6 +5291,8 @@
+ 
+ 	sbi->s_journal->j_submit_inode_data_buffers =
+ 		ext4_journal_submit_inode_data_buffers;
++	sbi->s_journal->j_dispatch_inode_data_buffers =
++		ext4_journal_dispatch_inode_data_buffers;
+ 	sbi->s_journal->j_finish_inode_data_buffers =
+ 		ext4_journal_finish_inode_data_buffers;
+ 
+--- ./fs/ext4/fsync.c	2023-03-09 12:05:21.110701816 +0900
++++ /home/oslab/fast_commit/kernel/5_18_18_barrier/./fs/ext4/fsync.c	2023-05-04 14:28:12.927984194 +0900
+@@ -113,7 +113,17 @@
+ 	    !jbd2_trans_will_send_data_barrier(journal, commit_tid))
+ 		*needs_barrier = true;
+ 
+-	return ext4_fc_commit(journal, commit_tid);
++	return jbd2_complete_transaction(journal, commit_tid);
++}
++
++static int ext4_fbarrier_journal(struct inode *inode, bool datasync,
++			     bool *needs_barrier)
++{
++	struct ext4_inode_info *ei = EXT4_I(inode);
++	journal_t *journal = EXT4_SB(inode->i_sb)->s_journal;
++	tid_t commit_tid = datasync ? ei->i_datasync_tid : ei->i_sync_tid;
++
++	return jbd2_dispatch_transaction(journal, commit_tid);
+ }
+ 
+ /*
+@@ -147,7 +157,7 @@
+ 	// journal_t *journal = EXT4_SB(inode->i_sb)->s_journal;
+ 	
+ #ifdef DEBUG_FSYNC_LATENCY
+-	ktime_t start1, end1;
++	ktime_t start1;
+ 	fsync_data temp;
+ 	int j = 0, seq = 0;
+ 
+@@ -172,20 +182,19 @@
+ 		goto out;
+ 	}
+ 
+-	/* UFS */
+-	// trace_ext4_sync_file_data_start(inode, datasync);
+-	//printk(KERN_INFO "[SWDBG] (%s) sync_start! pid : %d, tid : %d\n"
+-	//	,__func__,task_pid(current),commit_tid); 
+-	
+ 	if (datasync)
+ 		ret = file_write_and_wait_range(file, start, end);
+-	else
+-		ret = filemap_write_and_dispatch_range(file->f_mapping, start, end);
++	else {
++#ifdef DEBUG_FSYNC_LATENCY
++		ret = filemap_fdatawrite_range(file->f_mapping, start, end);
++		temp.fsync_intv[0] = ktime_sub(ktime_get(), start1); 
++		filemap_fdatadispatch_range(file->f_mapping, start, end);
++		temp.fsync_intv[1] = ktime_sub(ktime_get(), start1); 
 +#endif
++	}
+ 	if (ret)
+ 		goto out;
+ 	
+-	// trace_ext4_sync_file_data_complete(inode, datasync);
+-
+ 	/*
+ 	 * data=writeback,ordered:
+ 	 *  The caller's filemap_fdatawrite()/wait will sync the data.
+@@ -200,50 +209,38 @@
+ 	 *  (they were dirtied by commit).  But that's OK - the blocks are
+ 	 *  safe in-journal, which is all fsync() needs to ensure.
+ 	 */
+-#ifdef DEBUG_FSYNC_LATENCY
+-	//read_lock(&journal->j_state_lock);
+-	//spin_lock(&journal->j_list_lock);
+-	temp.fsync_intv[1] = 0; // journal->j_commit_sequence;
+-	temp.fsync_intv[2] = 0; // journal->j_transfer_sequence;
+-	temp.fsync_intv[3] = 0; // journal->j_flush_sequence;
+-	//spin_unlock(&journal->j_list_lock);
+-	//read_unlock(&journal->j_state_lock);
+-	temp.fsync_intv[4] = 0; // datasync ? ei->i_datasync_tid : ei->i_sync_tid; 
+-#endif
+ 	if (!sbi->s_journal)
+ 		ret = ext4_fsync_nojournal(inode, datasync, &needs_barrier);
+ 	else if (ext4_should_journal_data(inode))
+ 		ret = ext4_force_commit(inode->i_sb);
+-	else /* Need to be modified after Dual Mode Journaling is ported */
++	else 
+ 		ret = ext4_fsync_journal(inode, datasync, &needs_barrier);
++#ifdef DEBUG_FSYNC_LATENCY
++		temp.fsync_intv[2] = ktime_sub(ktime_get(), start1); 
++#endif
+ 
+ 	if (needs_barrier) {
+ 		err = blkdev_issue_flush(inode->i_sb->s_bdev);
+ 		if (!ret)
+ 			ret = err;
+ 	}
++#ifdef DEBUG_FSYNC_LATENCY
++	temp.fsync_intv[3] = ktime_sub(ktime_get(), start1); 
++#endif
+ 	
+-	// commit_tid = datasync ? ei->i_datasync_tid : ei->i_sync_tid;
+-	//printk(KERN_INFO "[SWDBG] (%s) sync_end! pid : %d, tid : %d\n"
+-	//	,__func__,task_pid(current),commit_tid); 
+ out:
+ 	err = file_check_and_advance_wb_err(file);
+ 	if (ret == 0)
+ 		ret = err;
+ 	trace_ext4_sync_file_exit(inode, ret);
+ #ifdef DEBUG_FSYNC_LATENCY
+-	end1 = ktime_get();
++	temp.fsync_intv[4] = ktime_sub(ktime_get(), start1); 
+ 	seq = atomic_add_return(1, &fsync_index);
+ 	if (seq >= 4000000)
+ 		return ret;
+-	temp.fsync_intv[0] += ktime_to_ns(ktime_sub(end1,start1));
+-	for (j = 0; j < 1; j++) {                                  
++	for (j = 0; j < 5; j++) {                                  
+         	fsync_array[seq-1].fsync_intv[j] = temp.fsync_intv[j];
+ 	}                                                      
+-        fsync_array[seq-1].fsync_intv[1] = temp.fsync_intv[1];
+-        fsync_array[seq-1].fsync_intv[2] = temp.fsync_intv[2];
+-        fsync_array[seq-1].fsync_intv[3] = temp.fsync_intv[3];
+-        fsync_array[seq-1].fsync_intv[4] = temp.fsync_intv[4];
+ #endif
+ 	return ret;
+ }
+@@ -251,11 +248,24 @@
+ /* UFS */
+ int ext4_fbarrier_file(struct file *file, loff_t start, loff_t end, int datasync)
+ {
+-	int ret = 0, err;
++	int ret = 0;
+ 	bool needs_barrier = false;
+ 	struct inode *inode = file->f_mapping->host;
+ 	struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
+ 
++		
++
++#ifdef DEBUG_FSYNC_LATENCY
++	ktime_t start1;
++	fsync_data temp;
++	int j = 0, seq = 0;
++
++	for (j = 0; j < 5; j++) {
++		temp.fsync_intv[j] = 0;
++	}
++	start1 = ktime_get();
++#endif
++
+ 	if (unlikely(ext4_forced_shutdown(sbi)))
+ 		return -EIO;
+ 
+@@ -271,15 +281,12 @@
+ 		goto out;
+ 	}
+ 
+-	if (datasync) {
+-		current->barrier_fail = 0;
+-		ret = filemap_ordered_write_range(file->f_mapping, start, end);
+-		if (current->barrier_fail)
+-			needs_barrier = true;
++#ifdef DEBUG_FSYNC_LATENCY
++	ret = filemap_fdatawrite_range(file->f_mapping, start, end);
++	temp.fsync_intv[0] = ktime_sub(ktime_get(), start1); 
+ 		filemap_fdatadispatch_range(file->f_mapping, start, end);
+-	}
+-	else
+-		ret = filemap_write_and_dispatch_range(file->f_mapping, start, end);
++	temp.fsync_intv[1] = ktime_sub(ktime_get(), start1); 
++#endif
+ 	if (ret)
+ 		goto out;
+ 
+@@ -301,15 +308,22 @@
+ 		ret = ext4_fsync_nojournal(inode, datasync, &needs_barrier);
+ 	else if (ext4_should_journal_data(inode))
+ 		ret = ext4_force_commit(inode->i_sb);
+-	else {/* Need to be modified after Dual Mode Journaling is ported */
+-		if (datasync && needs_barrier) 
+-			current->barrier_fail = 0;
+-		// ret = ext4_fsync_journal(inode, datasync, &needs_barrier);
++	else {
++		ret = ext4_fbarrier_journal(inode, datasync, &needs_barrier);
+ 	}
++#ifdef DEBUG_FSYNC_LATENCY
++	temp.fsync_intv[2] = ktime_sub(ktime_get(), start1); 
++#endif
+ out:
+-	// err = file_check_and_advance_wb_err(file);
+-	if (ret == 0)
+-		ret = err;
+ 	trace_ext4_sync_file_exit(inode, ret);
++#ifdef DEBUG_FSYNC_LATENCY
++	temp.fsync_intv[3] = ktime_sub(ktime_get(), start1); 
++	seq = atomic_add_return(1, &fsync_index);
++	if (seq >= 4000000)
++		return ret;
++	for (j = 0; j < 4; j++) {                                  
++        	fsync_array[seq-1].fsync_intv[j] = temp.fsync_intv[j];
++	}                                                      
++#endif
+ 	return ret;
+ }
+--- ./fs/jbd2/transaction.c	2023-01-25 11:39:49.485788684 +0900
++++ /home/oslab/fast_commit/kernel/5_18_18_barrier/./fs/jbd2/transaction.c	2023-05-03 19:39:55.142023985 +0900
+@@ -134,6 +134,7 @@
+ 	transaction->t_max_wait = 0;
+ 	transaction->t_start = jiffies;
+ 	transaction->t_requested = 0;
++	transaction->t_flush_trigger = 0;
+ }
+ 
+ /*
+--- ./fs/jbd2/commit.c	2023-05-03 19:41:36.702018027 +0900
++++ /home/oslab/fast_commit/kernel/5_18_18_barrier/./fs/jbd2/commit.c	2023-05-05 12:08:14.251915186 +0900
+@@ -34,6 +34,10 @@
+ 	struct buffer_head *orig_bh = bh->b_private;
+ 
+ 	BUFFER_TRACE(bh, "");
++	
++	// printk(KERN_INFO "[SWDBG] (%s) blocknr : %llu\n"
++	//	,__func__, bh->b_blocknr);
++
+ 	if (uptodate)
+ 		set_buffer_uptodate(bh);
+ 	else
+@@ -147,15 +151,16 @@
+ 
+ 	BUFFER_TRACE(bh, "submit commit block");
+ 	lock_buffer(bh);
++	lock_buffer_dispatch(bh);
+ 	clear_buffer_dirty(bh);
+ 	set_buffer_uptodate(bh);
+ 	bh->b_end_io = journal_end_buffer_io_sync;
+ 				
++	// printk(KERN_INFO "[SWDBG] (%s) commit block number : %llu\n"
++	//		,__func__, bh->b_blocknr);
++				
+ 	if (journal->j_flags & JBD2_BARRIER &&
+ 	    !jbd2_has_feature_async_commit(journal))
+-		ret = submit_bh(REQ_OP_WRITE,
+-			REQ_SYNC | REQ_ORDERED | REQ_BARRIER, bh);
+-	else
+ 		ret = submit_bh(REQ_OP_WRITE, REQ_SYNC, bh);
+ 
+ 	*cbh = bh;
+@@ -181,13 +186,10 @@
+ 	return ret;
+ }
+ 
+-/* UFS : Wrapping Function of dispatch checking of Journal Commit Record */
+-static int journal_wait_on_dispatch_of_commit_record(journal_t *journal,
++static void journal_dispatch_on_commit_record(journal_t *journal,
+ 					 struct buffer_head *bh)
+ {
+ 	wait_on_buffer_dispatch(bh);
+-
+-	return 0;
+ }
+ 
+ /*
+@@ -276,6 +278,15 @@
+ 	return ret;
+ }
+ 
++int jbd2_journal_dispatch_inode_data_buffers(struct jbd2_inode *jinode)
++{
++	struct address_space *mapping = jinode->i_vfs_inode->i_mapping;
++
++	return filemap_fdatadispatch_range_keep_errors(mapping,
++						   jinode->i_dirty_start,
++						   jinode->i_dirty_end);
++}
++
+ int jbd2_journal_finish_inode_data_buffers(struct jbd2_inode *jinode)
+ {
+ 	struct address_space *mapping = jinode->i_vfs_inode->i_mapping;
+@@ -335,6 +346,35 @@
+ 	return ret;
+ }
+ 
++static int journal_dispatch_inode_data_buffers(journal_t *journal,
++		transaction_t *commit_transaction)
++{
++	struct jbd2_inode *jinode, *next_i;
++	int err, ret = 0;
++
++	/* For locking, see the comment in journal_submit_data_buffers() */
++	spin_lock(&journal->j_list_lock);
++	list_for_each_entry(jinode, &commit_transaction->t_inode_list, i_list) {
++		if (!(jinode->i_flags & JI_WAIT_DATA))
++			continue;
++		jinode->i_flags |= JI_COMMIT_RUNNING;
++		spin_unlock(&journal->j_list_lock);
++		/* wait for the inode data buffers writeout. */
++		if (journal->j_finish_inode_data_buffers) {
++			err = journal->j_finish_inode_data_buffers(jinode);
++			if (!ret)
++				ret = err;
++		}
++		spin_lock(&journal->j_list_lock);
++		jinode->i_flags &= ~JI_COMMIT_RUNNING;
++		smp_mb();
++		wake_up_bit(&jinode->i_flags, __JI_COMMIT_RUNNING);
++	}
++	spin_unlock(&journal->j_list_lock);
++
++	return ret;
++}
++
+ static __u32 jbd2_checksum_data(__u32 crc32_sum, struct buffer_head *bh)
+ {
+ 	struct page *page = bh->b_page;
+@@ -1225,7 +1265,7 @@
+ 
+ #ifdef DEBUG_PROC_OP
+ typedef struct {
+-	s64 op_intv[5];
++	s64 op_intv[7];
+ } op_data; 
+ extern op_data op_array[4000000];
+ extern atomic_t op_index;
+@@ -1275,19 +1315,14 @@
+ 	struct blk_plug plug;
+ 	/* Tail of the journal */
+ 	int csum_size = 0;
+-	/* UFS */
+-	LIST_HEAD(t_io_bufs);
+-	LIST_HEAD(t_log_bufs);
+ 	/* CJFS */
+ 	int ver_tid;
+-	ktime_t start, dispatch_start, c_wait_start;
++	struct list_head *pos = NULL;
+ 	int seq;
+ 
+ 	if (jbd2_journal_has_csum_v2or3(journal))
+ 		csum_size = sizeof(struct jbd2_journal_block_tail);
+ 
+-	// commit_transaction->t_commit_start_time = ktime_get();
+-
+ 	/*
+ 	 * First job: lock down the current transaction and wait for
+ 	 * all outstanding updates to complete.
+@@ -1341,9 +1376,8 @@
+ 	commit_transaction = journal->j_running_transaction;
+ 	ver_tid = commit_transaction->t_tid % MAX_JH_VERSION;
+ 
+-	// commit_transaction->t_commit_start_time = ktime_get();
+ #ifdef DEBUG_PROC_OP
+-	c_wait_start = ktime_get();
++	commit_transaction->t_commit_start_time = ktime_get();
+ #endif
+ 
+ #ifdef OP_COALESCING
+@@ -1359,8 +1393,6 @@
+ 	read_unlock(&journal->j_state_lock);
+ #endif
+ 
+-	start = ktime_get();
+-
+ 	trace_jbd2_start_commit(journal, commit_transaction);
+ 	jbd_debug(1, "JBD2: starting commit of transaction %d\n",
+ 			commit_transaction->t_tid);
+@@ -1413,19 +1445,13 @@
+ 	}
+ 	write_lock(&journal->j_state_lock);
+ #endif
++
+ #ifdef DEBUG_PROC_OP
+ 	seq = atomic_add_return(1, &op_index);
+ 	commit_transaction->seq = seq;
+ 	op_array[seq - 1].op_intv[0] = 
+-		commit_transaction->t_tid;
+-	op_array[seq - 1].op_intv[1] = 
+-		atomic_read(&commit_transaction->t_pconflict_count);
+-	op_array[seq - 1].op_intv[2] = 
+-		ktime_to_ns(ktime_sub(ktime_get(), c_wait_start));
+-	// seq = atomic_add_return(1, &cc_index);
+-	// cc_array[seq - 1].cc_intv[0] = atomic_read(&commit_transaction->t_pconflict_count);
++                ktime_to_ns(ktime_sub(ktime_get(), commit_transaction->t_commit_start_time));
+ #endif
+-
+ 	/*
+ 	 * First thing we are allowed to do is to discard any remaining
+ 	 * BJ_Reserved buffers.  Note, it is _not_ permissible to assume
+@@ -1517,7 +1543,8 @@
+ 		jbd2_journal_abort(journal, err);
+ 
+ 	blk_start_plug(&plug);
+-	jbd2_journal_write_revoke_records(commit_transaction, &t_log_bufs);
++	jbd2_journal_write_revoke_records(commit_transaction,
++	                                  &commit_transaction->t_log_bufs);
+ 
+ 	jbd_debug(3, "JBD2: commit phase 2b\n");
+ 
+@@ -1544,7 +1571,6 @@
+ 	err = 0;
+ 	bufs = 0;
+ 	descriptor = NULL;
+-	dispatch_start = ktime_get();
+ 	while (commit_transaction->t_buffers) {
+ 
+ 		/* Find the next buffer to be journaled... */
+@@ -1601,7 +1627,7 @@
+ 			/* Record it so that we can wait for IO
+                            completion later */
+ 			BUFFER_TRACE(descriptor, "ph3: file as descriptor");
+-			jbd2_file_log_bh(&t_log_bufs, descriptor);
++			jbd2_file_log_bh(&commit_transaction->t_log_bufs, descriptor);
+ 		}
+ 
+ 		/* Where is the buffer to be written? */
+@@ -1632,16 +1658,13 @@
+ 		 */
+ 		set_bit(BH_JWrite, &jh2bh(jh)->b_state);
+ 		JBUFFER_TRACE(jh, "ph3: write metadata");
+-		// seq = atomic_add_return(1, &op_index);
+-		start = ktime_get();
+ 		flags = jbd2_journal_write_metadata_buffer(commit_transaction,
+ 						jh, &wbuf[bufs], blocknr);
+-		// op_array[seq - 1].op_intv[0] = ktime_to_ns(ktime_sub(ktime_get(),start));
+ 		if (flags < 0) {
+ 			jbd2_journal_abort(journal, flags);
+ 			continue;
+ 		}
+-		jbd2_file_log_bh(&t_io_bufs, wbuf[bufs]);
++		jbd2_file_log_bh(&commit_transaction->t_io_bufs, wbuf[bufs]);
+ 
+ 		/* Record the new block's tag in the current descriptor
+                    buffer */
+@@ -1699,21 +1722,13 @@
+ 				}
+ 
+ 				lock_buffer(bh);
++				lock_buffer_dispatch(bh);
+ 				clear_buffer_dirty(bh);
+ 				set_buffer_uptodate(bh);
+ 				bh->b_end_io = journal_end_buffer_io_sync;
+-				// submit_bh(REQ_OP_WRITE, REQ_SYNC, bh);
+-				/* UFS */
+-				bh->b_tx = bh->b_tx == NULL ? commit_transaction : bh->b_tx;
+-				if (commit_transaction->t_buffers != NULL) {
+-					submit_bh(REQ_OP_WRITE, REQ_SYNC | REQ_ORDERED, bh);
+-				} else if (i == bufs - 1 
+-						&& commit_transaction->t_buffers == NULL) {
+-					submit_bh(REQ_OP_WRITE, 
+-						REQ_SYNC | REQ_ORDERED | REQ_BARRIER, bh);
+-				} else {
+-					submit_bh(REQ_OP_WRITE, REQ_SYNC | REQ_ORDERED, bh);
+-				}
++				submit_bh(REQ_OP_WRITE, REQ_SYNC, bh);
++				// printk(KERN_INFO "[SWDBG] (%s) blocknr : %llu\n"
++				//	,__func__, bh->b_blocknr);
+ 			}
+ 			cond_resched();
+ 
+@@ -1724,20 +1739,64 @@
+ 		}
+ 	}
+ 
++        blk_finish_plug(&plug);
++        
+ #ifdef DEBUG_PROC_OP
+-	// op_array[seq - 1].op_intv[1] = ktime_to_ns(ktime_sub(ktime_get(), dispatch_start));
++	op_array[seq - 1].op_intv[1] =
++                ktime_to_ns(ktime_sub(ktime_get(), commit_transaction->t_commit_start_time));
+ #endif
+ 
+-	err = journal_finish_inode_data_buffers(journal, commit_transaction);
++	err = journal_dispatch_inode_data_buffers(journal, commit_transaction);
++        
+ 	if (err) {
+ 		printk(KERN_WARNING
+-			"JBD2: Detected IO errors while flushing file data "
++                        "JBD2: Detected IO errors while dispatching file data "
+ 		       "on %s\n", journal->j_devname);
+ 		if (journal->j_flags & JBD2_ABORT_ON_SYNCDATA_ERR)
+ 			jbd2_journal_abort(journal, err);
+ 		err = 0;
+ 	}
+ 
++        pos = NULL;
++        list_for_each (pos, &commit_transaction->t_io_bufs) {
++                struct buffer_head *bh = list_entry(pos, struct buffer_head,
++                                                    b_assoc_buffers);
++                wait_on_buffer_dispatch(bh);
++
++        }
++
++        pos = NULL;
++        list_for_each (pos, &commit_transaction->t_log_bufs) {
++                struct buffer_head *bh = list_entry(pos, struct buffer_head,
++                                                    b_assoc_buffers);
++                wait_on_buffer_dispatch(bh);
++
++        }
++
++#ifdef DEBUG_PROC_OP
++	op_array[seq - 1].op_intv[2] =
++                ktime_to_ns(ktime_sub(ktime_get(), commit_transaction->t_commit_start_time));
++#endif
++	
++	err = journal_submit_commit_record(journal, commit_transaction,
++                                         &commit_transaction->t_cbh, 
++					 &commit_transaction->t_crc32_sum);
++        if (err)
++                jbd2_journal_abort(journal, err);
++
++#ifdef DEBUG_PROC_OP
++	op_array[seq - 1].op_intv[3] =
++                ktime_to_ns(ktime_sub(ktime_get(), commit_transaction->t_commit_start_time));
++#endif
++
++        if (commit_transaction->t_cbh)
++                wait_on_buffer_dispatch(commit_transaction->t_cbh);
++
++#ifdef DEBUG_PROC_OP
++	op_array[seq - 1].op_intv[4] =
++                ktime_to_ns(ktime_sub(ktime_get(), commit_transaction->t_commit_start_time));
++#endif
++
+ 	/*
+ 	 * Get current oldest transaction in the log before we issue flush
+ 	 * to the filesystem device. After the flush we can be sure that
+@@ -1783,48 +1842,6 @@
+ 			jbd2_journal_abort(journal, err);
+ 	}
+ 
+-	blk_finish_plug(&plug);
+-
+-	/*
+-	 * Here, we wait for the completion of dispatch. Because we don't have
+-	 * an order-preserving block layer yet, I commented this code out now.
+-	 * If the order-preserving block layer is implemented, We can
+-	 * uncomment this code.
+-	 * - 2022. 8. 26. Joontaek Oh.
+-	 */
+-
+-	while (!list_empty(&t_io_bufs)) {
+-		struct buffer_head *bh = list_entry(t_io_bufs.prev,
+-		       				    struct buffer_head,
+-		       			 	    b_assoc_buffers);
+-		wait_on_buffer_dispatch(bh);
+-
+-		jbd2_unfile_log_bh(bh);
+-		jbd2_file_log_bh(&commit_transaction->t_io_bufs, bh);
+-	}
+-
+-	while (!list_empty(&t_log_bufs)) {
+-		struct buffer_head *bh = list_entry(t_log_bufs.prev,
+-		                		    struct buffer_head, 
+-						    b_assoc_buffers);
+-		wait_on_buffer_dispatch(bh);
+-		jbd2_unfile_log_bh(bh);
+-		jbd2_file_log_bh(&commit_transaction->t_log_bufs, bh);
+-	}
+-
+-	if (!jbd2_has_feature_async_commit(journal)) {
+-		err = journal_submit_commit_record(journal, commit_transaction,
+-		                              &commit_transaction->t_cbh,
+-		                              commit_transaction->t_crc32_sum);
+-		if (err)
+-			jbd2_journal_abort(journal, err);
+-	}
+-
+-	/* UFS */
+-	if (commit_transaction->t_cbh)
+-		err = journal_wait_on_dispatch_of_commit_record(journal, 
+-				commit_transaction->t_cbh);
+-
+ 	/*
+ 	 * Insert the committing transaction into the flush transaction list.
+ 	 * The flush thead will get the committing transaction and flush it.
+@@ -1847,53 +1864,10 @@
+ 	}
+ 	spin_unlock(&journal->j_list_lock);
+ 
+-
+-	/* Done with this transaction! */
+ 	write_lock(&journal->j_state_lock);
+-	jbd_debug(3, "JBD2: commit phase 7\n");
+-
+-	commit_transaction->t_start = jiffies;
+-	commit_transaction->stats.run.rs_logging = jbd2_time_diff(commit_transaction->stats.
+-						run.rs_logging,
+-					      commit_transaction->t_start);
+-
+-	/*
+-	 * File the transaction statistics
+-	 */
+-	commit_transaction->stats.ts_tid = commit_transaction->t_tid;
+-	commit_transaction->stats.run.rs_handle_count =
+-		atomic_read(&commit_transaction->t_handle_count);
+-	trace_jbd2_run_stats(journal->j_fs_dev->bd_dev,
+-			     commit_transaction->t_tid, &commit_transaction->stats.run);
+-	commit_transaction->stats.ts_requested = (commit_transaction->t_requested) ? 1 : 0;
+-
+-	J_ASSERT(commit_transaction == journal->j_committing_transaction);
+ 	journal->j_commit_sequence = commit_transaction->t_tid;
  	journal->j_committing_transaction = NULL;
- 	commit_time = ktime_to_ns(ktime_sub(ktime_get(), start_time));
+-	// commit_time = ktime_to_ns(ktime_sub(ktime_get(), commit_transaction->start_time));
+-
+-	/*
+-	 * weight the commit time higher than the average time so we don't
+-	 * react too strongly to vast changes in the commit time
+-	 */
+-	/* CJFS
+-	if (likely(journal->j_average_commit_time))
+-		journal->j_average_commit_time = (commit_time +
+-				journal->j_average_commit_time*3) / 4;
+-	else
+-		journal->j_average_commit_time = commit_time;
+-	*/
+-
+ 	write_unlock(&journal->j_state_lock);
+-
+-	if (journal->j_commit_callback)
+-		journal->j_commit_callback(journal, commit_transaction);
+-	if (journal->j_fc_cleanup_callback)
+-		journal->j_fc_cleanup_callback(journal, 1, commit_transaction->t_tid);
+-
+-	trace_jbd2_end_commit(journal, commit_transaction);
+-	jbd_debug(1, "JBD2: commit %d complete, head %d\n",
+-		  journal->j_commit_sequence, journal->j_tail_sequence);
+ }
  
-@@ -1848,7 +1854,8 @@ void jbd2_journal_barrier_commit_transaction(journal_t *journal)
- 	commit_transaction->stats.ts_requested = (commit_transaction->t_requested) ? 1 : 0;
+ /*
+@@ -1919,7 +1893,7 @@
+ 	int commit_empty;
+ #endif
+ 	/* CJFS */
+-	int ver_tid, seq;
++	int ver_tid;
  
- 	J_ASSERT(commit_transaction == journal->j_committing_transaction);
--	journal->j_commit_sequence = commit_transaction->t_tid;
-+	/* CJFS */
-+	// journal->j_commit_sequence = commit_transaction->t_tid;
- 	journal->j_committing_transaction = NULL;
- 	// commit_time = ktime_to_ns(ktime_sub(ktime_get(), commit_transaction->start_time));
+ 	/*
+ 	 * Bring the committing transaction which has been processed
+@@ -1939,8 +1913,6 @@
+ 	commit_empty = journal->j_flushing_transactions 
+ 		== commit_transaction->t_flushnext ? 1 : 0;
+ #endif
+-	// printk(KERN_INFO "[SWDBG] (%s) tid : %d flush_tid : %d, commit_emtpy : %d\n"
+-	//		,__func__, commit_transaction->t_tid, flush_tid, commit_empty);
+ 	spin_unlock(&journal->j_list_lock);
+ 	
+ 	/* Lo and behold: we have just managed to send a transaction to
+@@ -1956,6 +1928,17 @@
  
-diff --git a/kernels/5_18_18_barrier/fs/jbd2/journal.c b/kernels/5_18_18_barrier/fs/jbd2/journal.c
-index 939fcfe..e238592 100644
---- a/kernels/5_18_18_barrier/fs/jbd2/journal.c
-+++ b/kernels/5_18_18_barrier/fs/jbd2/journal.c
-@@ -994,8 +994,8 @@ int jbd2_complete_transaction(journal_t *journal, tid_t tid)
+ 	jbd_debug(3, "JBD2: commit phase 3\n");
+ 
++	err = journal_finish_inode_data_buffers(journal, commit_transaction);
++        
++	if (err) {
++                printk(KERN_WARNING
++                        "JBD2: Detected IO errors while dispatching file data "
++                       "on %s\n", journal->j_devname);
++                if (journal->j_flags & JBD2_ABORT_ON_SYNCDATA_ERR)
++                        jbd2_journal_abort(journal, err);
++                err = 0;
++        }
++
+ 	while (!list_empty(&commit_transaction->t_io_bufs)) {
+ 		struct buffer_head *bh =
+ 		                 list_entry(commit_transaction->t_io_bufs.prev,
+@@ -2023,6 +2006,11 @@
+ 	if (err)
+ 		jbd2_journal_abort(journal, err);
+ 
++#ifdef DEBUG_PROC_OP
++	op_array[commit_transaction->seq - 1].op_intv[5] =
++                ktime_to_ns(ktime_sub(ktime_get(), commit_transaction->t_commit_start_time));
++#endif
++
+ 	jbd_debug(3, "JBD2: commit phase 5\n");
+ 	write_lock(&journal->j_state_lock);
+ 	J_ASSERT(commit_transaction->t_state == T_COMMIT_DFLUSH);
+@@ -2030,32 +2018,31 @@
+ 	write_unlock(&journal->j_state_lock);
+ 
+ 	if (commit_transaction->t_cbh)
+-		err = journal_wait_on_commit_record(journal, commit_transaction->t_cbh);
++		err = journal_wait_on_commit_record(journal, 
++					commit_transaction->t_cbh);
+ 	commit_transaction->stats.run.rs_blocks_logged++;
+ #ifdef COMPOUND_FLUSH
+-	//printk(KERN_INFO "[SWDBG] (%s) tid : %d, flush_tid : %d, commit_emtpy : %d\n"
+-	//	,__func__, commit_transaction->t_tid, flush_tid, commit_empty);
++	/*
++	 * Compound Flush should be modified because we removed order-preserving
++	 * mechanism from this branch. In Compoud Flush, when a flush command is
++	 * not needed, the flush command in the write command of the commit block
++	 * has to be removed, not the single command below.
++	 * - Joontaek Oh.
++	 */
+ 	if ((journal->j_flags & JBD2_BARRIER) 
++		&& commit_transaction->t_flush_trigger
+ 		&& (flush_tid == 0 || commit_empty == 1)) {
+ 		blkdev_issue_flush(journal->j_dev);
+-		// printk(KERN_INFO "[SWDBG] (%s) tid : %d, wait on flush ! flush_tid : %d, commit_emtpy : %d\n"
+-		//	,__func__, commit_transaction->t_tid, flush_tid, commit_empty);
+-	}
+-#ifdef DEBUG_PROC_OP
+-	seq = commit_transaction->seq;
+-	op_array[seq - 1].op_intv[3] = 
+-		commit_transaction->stats.run.rs_blocks;
+-	op_array[seq - 1].op_intv[4] = 
+-		((journal->j_flags & JBD2_BARRIER) && (flush_tid == 0 || commit_empty == 1)) ? 1 : 0;
+-#endif
+-#else
+-	if (journal->j_flags & JBD2_BARRIER) {
+-		blkdev_issue_flush(journal->j_dev);
+ 	}
+ #endif
+ 	if (err)
+ 		jbd2_journal_abort(journal, err);
+ 
++/* #ifdef DEBUG_PROC_OP
++	op_array[commit_transaction->seq - 1].op_intv[5] =
++                ktime_to_ns(ktime_sub(ktime_get(), commit_transaction->t_commit_start_time));
++#endif */
++
+ 	WARN_ON_ONCE(
+ 		atomic_read(&commit_transaction->t_outstanding_credits) < 0);
+ 
+@@ -2154,7 +2141,6 @@
+ 		 * since the buffer may be still accessible when blocksize <
+ 		 * pagesize and it is attached to the last partial page.
+ 		 */
+-		/* CJFS */
+ 		if (buffer_freed(bh) && jh->b_ver_count == 1) {
+ 			struct address_space *mapping;
+ 
+@@ -2232,9 +2218,11 @@
+ 	}
+ #ifdef COMPOUND_FLUSH	
+ 	journal->j_transfer_sequence = commit_transaction->t_tid;
+-	if (flush_tid == 0 || commit_empty == 1) 
++	if (commit_transaction->t_flush_trigger && 
++		(flush_tid == 0 || commit_empty == 1)) 
+ 		journal->j_flush_sequence = commit_transaction->t_tid;
+ #else
++	if (commit_transaction->t_flush_trigger)
+ 	journal->j_flush_sequence = commit_transaction->t_tid;
+ #endif
+ 
+@@ -2256,8 +2244,59 @@
+ 				commit_transaction;
+ 	}
+ 	spin_unlock(&journal->j_list_lock);
++
++	/* Done with this transaction! */
++
++	jbd_debug(3, "JBD2: commit phase 7\n");
++
++	J_ASSERT(commit_transaction->t_state == T_COMMIT_JFLUSH);
++
++	commit_transaction->t_start = jiffies;
++	commit_transaction->stats.run.rs_logging = jbd2_time_diff(commit_transaction->stats.
++						run.rs_logging, commit_transaction->t_start);
++
++	/*
++	 * File the transaction statistics
++	 */
++	commit_transaction->stats.ts_tid = commit_transaction->t_tid;
++	commit_transaction->stats.run.rs_handle_count =
++		atomic_read(&commit_transaction->t_handle_count);
++	trace_jbd2_run_stats(journal->j_fs_dev->bd_dev,
++			     commit_transaction->t_tid, &commit_transaction->stats.run);
++	commit_transaction->stats.ts_requested = (commit_transaction->t_requested) ? 1 : 0;
++
++	commit_transaction->t_state = T_COMMIT_CALLBACK;
++
++	J_ASSERT(commit_transaction == journal->j_flushing_transactions);
++	commit_transaction->commit_time = ktime_to_ns(ktime_sub(ktime_get(),
++	                                         commit_transaction->t_commit_start_time));
++
++	/*
++	 * weight the commit time higher than the average time so we don't
++	 * react too strongly to vast changes in the commit time
++	 */
++	if (likely(journal->j_average_commit_time))
++		journal->j_average_commit_time = (commit_transaction->commit_time +
++				journal->j_average_commit_time*3) / 4;
++	else
++		journal->j_average_commit_time = commit_transaction->commit_time;
++
+ 	write_unlock(&journal->j_state_lock);
+ 
++	if (journal->j_commit_callback)
++		journal->j_commit_callback(journal, commit_transaction);
++	if (journal->j_fc_cleanup_callback)
++		journal->j_fc_cleanup_callback(journal, 1, commit_transaction->t_tid);
++
++	trace_jbd2_end_commit(journal, commit_transaction);
++	jbd_debug(1, "JBD2: commit %d complete, head %d\n",
++		  journal->j_flush_sequence, journal->j_tail_sequence);
++
++#ifdef DEBUG_PROC_OP
++	op_array[commit_transaction->seq - 1].op_intv[6] =
++                ktime_to_ns(ktime_sub(ktime_get(), commit_transaction->t_commit_start_time));
++#endif
++
+ 	write_lock(&journal->j_state_lock);
+ 	journal->j_flags &= ~JBD2_FULL_COMMIT_ONGOING;
+ 	journal->j_flags &= ~JBD2_FAST_COMMIT_ONGOING;
+@@ -2270,19 +2309,10 @@
+ 		jbd2_journal_free_transaction(commit_transaction);
+ 	}
+ 	spin_unlock(&journal->j_list_lock);
+-
+-	commit_transaction->commit_time = ktime_to_ns(ktime_sub(ktime_get(), 
+-				commit_transaction->t_commit_start_time));
+-	
+-	if (likely(journal->j_average_commit_time))
+-		journal->j_average_commit_time = (commit_transaction->commit_time +
+-				journal->j_average_commit_time*3) / 4;
+-	else
+-		journal->j_average_commit_time = commit_transaction->commit_time;
+-	
+ 	write_unlock(&journal->j_state_lock);
+ 	wake_up(&journal->j_wait_done_commit);
+ 	wake_up(&journal->j_fc_wait);
++
+ 	/*
+ 	 * Calculate overall stats
+ 	 */
+@@ -2313,5 +2343,4 @@
+ 	if (journal->j_flushing_transactions == commit_transaction)
+ 		journal->j_flushing_transactions = NULL;
+ 	spin_unlock(&journal->j_list_lock);
+-	
+ }
+--- ./fs/jbd2/journal.c	2023-05-03 19:41:36.702018027 +0900
++++ /home/oslab/fast_commit/kernel/5_18_18_barrier/./fs/jbd2/journal.c	2023-05-05 23:25:30.059941596 +0900
+@@ -103,7 +103,7 @@
+ #ifdef DEBUG_PROC_OP
+ /* Tx ID, # of Tx Conflict, wait time for Tx Conflict, # of blocks, Flush */
+ typedef struct {
+-	s64 op_intv[5];
++	s64 op_intv[7];
+ } op_data;
+ 
+ atomic_t op_index;
+@@ -260,6 +260,7 @@
+ 
+ 		jbd2_journal_barrier_commit_transaction(journal);
+ 
++		wake_up(&journal->j_wait_done_commit);
+ 		wake_up(&journal->j_wait_flush);
+ 
+ 		write_lock(&journal->j_state_lock);
+@@ -342,7 +343,6 @@
+ static int kjournald2flush(void *arg)
+ {
+ 	journal_t *journal = arg;
+-	//transaction_t *transaction;
+ 
+ 	set_freezable();
+ 
+@@ -658,6 +658,44 @@
+ 		 */
+ 
+ 		journal->j_commit_request = target;
++		journal->j_running_transaction->t_flush_trigger = 1;
++		jbd_debug(1, "JBD2: requesting commit %u/%u\n",
++			  journal->j_commit_request,
++			  journal->j_commit_sequence);
++		journal->j_running_transaction->t_requested = jiffies;
++		wake_up(&journal->j_wait_commit);
++		return 1;
++	} else if (!tid_geq(journal->j_commit_request, target))
++		/* This should never happen, but if it does, preserve
++		   the evidence before kjournald goes into a loop and
++		   increments j_commit_sequence beyond all recognition. */
++		WARN_ONCE(1, "JBD2: bad log_start_commit: %u %u %u %u\n",
++			  journal->j_commit_request,
++			  journal->j_commit_sequence,
++			  target, journal->j_running_transaction ?
++			  journal->j_running_transaction->t_tid : 0);
++	return 0;
++}
++
++int __jbd2_log_start_dispatch(journal_t *journal, tid_t target)
++{
++	/* Return if the txn has already requested to be committed */
++	if (journal->j_commit_request == target)
++		return 0;
++
++	/*
++	 * The only transaction we can possibly wait upon is the
++	 * currently running transaction (if it exists).  Otherwise,
++	 * the target tid must be an old one.
++	 */
++	if (journal->j_running_transaction &&
++	    journal->j_running_transaction->t_tid == target) {
++		/*
++		 * We want a new commit: OK, mark the request and wakeup the
++		 * commit thread.  We do _not_ do the commit ourselves.
++		 */
++
++		journal->j_commit_request = target;
+ 		jbd_debug(1, "JBD2: requesting commit %u/%u\n",
+ 			  journal->j_commit_request,
+ 			  journal->j_commit_sequence);
+@@ -686,6 +724,15 @@
+ 	return ret;
+ }
+ 
++int jbd2_log_start_dispatch(journal_t *journal, tid_t tid)
++{
++	int ret;
++
++	write_lock(&journal->j_state_lock);
++	ret = __jbd2_log_start_dispatch(journal, tid);
++	write_unlock(&journal->j_state_lock);
++	return ret;
++}
+ /*
+  * Force and wait any uncommitted transactions.  We can only force the running
+  * transaction if we don't have an active handle, otherwise, we will deadlock.
+@@ -808,6 +855,7 @@
+ 	/* Transaction already committed? */
+ 	if (tid_geq(journal->j_commit_sequence, tid))
+ 		goto out;
++
+ 	commit_trans = journal->j_committing_transaction;
+ 	if (!commit_trans || commit_trans->t_tid != tid) {
+ 		ret = 1;
+@@ -879,6 +927,26 @@
+ 	return err;
+ }
+ 
++int jbd2_log_wait_dispatch(journal_t *journal, tid_t tid)
++{
++	int err = 0;
++
++	read_lock(&journal->j_state_lock);
++	while (tid_gt(tid, journal->j_commit_sequence)) {
++		jbd_debug(1, "JBD2: want %u, j_commit_sequence=%u\n",
++				  tid, journal->j_commit_sequence);
++		read_unlock(&journal->j_state_lock);
++		wake_up(&journal->j_wait_commit);
++		wait_event(journal->j_wait_done_commit,
++				!tid_gt(tid, journal->j_commit_sequence));
++		read_lock(&journal->j_state_lock);
++	}
++	read_unlock(&journal->j_state_lock);
++
++	if (unlikely(is_journal_aborted(journal)))
++		err = -EIO;
++	return err;
++}
+ /*
+  * Start a fast commit. If there's an ongoing fast or full commit wait for
+  * it to complete. Returns 0 if a new fast commit was started. Returns -EALREADY
+@@ -997,13 +1065,8 @@
  			jbd2_log_start_commit(journal, tid);
  			goto wait_commit;
  		}
 -	} else if (!(journal->j_committing_transaction &&
--		     journal->j_committing_transaction->t_tid == tid))
-+	/* CJFS */
-+	} else if (tid_geq(journal->j_commit_sequence, tid))
- 		need_to_wait = 0;
+-		     journal->j_committing_transaction->t_tid == tid)) {
+-		if (tid_geq(journal->j_flush_sequence, tid))
++	} else if (tid_geq(journal->j_flush_sequence, tid)){
+                         need_to_wait = 0;
+-                else    
+-                        wake_up(&journal->j_wait_flush);
+-                // need_to_wait = 0;
+ 	}
  	read_unlock(&journal->j_state_lock);
  	if (!need_to_wait)
-diff --git a/kernels/5_18_18_barrier/include/linux/journal-head.h b/kernels/5_18_18_barrier/include/linux/journal-head.h
-index 1bec868..128bf17 100644
---- a/kernels/5_18_18_barrier/include/linux/journal-head.h
-+++ b/kernels/5_18_18_barrier/include/linux/journal-head.h
-@@ -13,7 +13,7 @@
+@@ -1013,6 +1076,30 @@
+ }
+ EXPORT_SYMBOL(jbd2_complete_transaction);
+ 
++int jbd2_dispatch_transaction(journal_t *journal, tid_t tid)
++{
++	int	need_to_wait = 1;
++
++	read_lock(&journal->j_state_lock);
++	if (journal->j_running_transaction &&
++	    journal->j_running_transaction->t_tid == tid) {
++		if (journal->j_commit_request != tid) {
++			/* transaction not yet started, so request it */
++			read_unlock(&journal->j_state_lock);
++			jbd2_log_start_dispatch(journal, tid);
++			goto wait_dispatch;
++		}
++	} else if (tid_geq(journal->j_commit_sequence, tid)) {
++        	need_to_wait = 0;
++	}
++	read_unlock(&journal->j_state_lock);
++	if (!need_to_wait)
++		return 0;
++wait_dispatch:
++	return jbd2_log_wait_dispatch(journal, tid);
++}
++EXPORT_SYMBOL(jbd2_dispatch_transaction);
++
+ /*
+  * Log buffer allocation routines:
+  */
+@@ -1423,14 +1510,16 @@
+         int i = 0;                                             
+                                                                
+         for (i = 0; i < 100; i++) {                            
+-                seq_printf(seq,"%d %d %llu %llu %llu %llu %llu\n",                 
++                seq_printf(seq,"%d %d %llu %llu %llu %llu %llu %llu %llu\n",                 
+                         end,                                   
+                         cnt,                                   
+                         op_array[cnt].op_intv[0],
+                         op_array[cnt].op_intv[1],
+                         op_array[cnt].op_intv[2],
+                         op_array[cnt].op_intv[3],
+-                        op_array[cnt].op_intv[4]);             
++                        op_array[cnt].op_intv[4],
++                        op_array[cnt].op_intv[5],
++                        op_array[cnt].op_intv[6]);             
+                                                                
+                 op_array[cnt].op_intv[0] = 0;                  
+                 cnt++;                                         
+@@ -1586,7 +1675,7 @@
+ {
+ 	remove_proc_entry("info", journal->j_proc_entry);
+ #ifdef DEBUG_PROC_OP	
+-	remove_proc_entry("info", journal->j_proc_entry);
++	remove_proc_entry("op", journal->j_proc_entry);
+ 	remove_proc_entry("cc", journal->j_proc_entry);
+ #endif
+ #ifdef DEBUG_FSYNC_LATENCY
+--- ./fs/buffer.c	2023-01-25 11:39:51.090788617 +0900
++++ /home/oslab/fast_commit/kernel/5_18_18_barrier/./fs/buffer.c	2023-05-05 11:33:47.907974398 +0900
+@@ -80,8 +80,7 @@
+ /* UFS */
+ void __lock_buffer_dispatch(struct buffer_head *bh)
+ {
+-	wait_on_bit_lock_action(&bh->b_state, BH_Dispatch,
+-		       	sleep_on_buffer, TASK_UNINTERRUPTIBLE);
++	wait_on_bit_lock_io(&bh->b_state, BH_Dispatch, TASK_UNINTERRUPTIBLE);
+ }
+ EXPORT_SYMBOL(__lock_buffer_dispatch);
+ 
+@@ -142,7 +141,7 @@
+ /* UFS */
+ void __wait_on_buffer_dispatch(struct buffer_head * bh)
+ {
+-	wait_on_bit_action(&bh->b_state, BH_Dispatch, sleep_on_buffer, TASK_UNINTERRUPTIBLE);
++	wait_on_bit_io(&bh->b_state, BH_Dispatch, TASK_UNINTERRUPTIBLE);
+ }
+ EXPORT_SYMBOL(__wait_on_buffer_dispatch);
+ 
+@@ -3069,7 +3068,6 @@
+ 		wbc_account_cgroup_owner(wbc, bh->b_page, bh->b_size);
+ 	}
+ 
+-	lock_buffer_dispatch(bh);
+ 	submit_bio(bio);
+ 	return 0;
+ }
+@@ -3084,9 +3082,14 @@
+ int dispatch_bio_bh(struct bio *bio)
+ {
+ 	if ((bio->bi_end_io == end_bio_bh_io_sync) && bio->bi_private) {
+-		// struct buffer_head *bh = bio->bi_private;
++		struct buffer_head *bh = bio->bi_private;
++		
++		/* if (buffer_dispatch(bh)) {
++			printk(KERN_INFO "[SWDBG] (%s) blocknr : %llu\n"
++				,__func__, bh->b_blocknr);
++		} */
+ 		
+-		wake_up_buffer_dispatch(bio->bi_private);
++		wake_up_buffer_dispatch(bh);
+ 		return 1;
+ 	}
+ 	return 0;
+--- ./include/linux/pagemap.h	2023-01-25 11:39:51.723788590 +0900
++++ /home/oslab/fast_commit/kernel/5_18_18_barrier/./include/linux/pagemap.h	2023-05-03 20:07:31.017926844 +0900
+@@ -37,6 +37,8 @@
+ int filemap_fdatawait_range(struct address_space *, loff_t lstart, loff_t lend);
+ int filemap_fdatawait_range_keep_errors(struct address_space *mapping,
+ 		loff_t start_byte, loff_t end_byte);
++int filemap_fdatadispatch_range_keep_errors(struct address_space *mapping,
++		loff_t start_byte, loff_t end_byte);
+ 
+ static inline int filemap_fdatawait(struct address_space *mapping)
+ {
+--- ./include/linux/sched.h	2023-01-25 11:39:51.869788584 +0900
++++ /home/oslab/fast_commit/kernel/5_18_18_barrier/./include/linux/sched.h	2023-05-04 13:17:01.264881841 +0900
+@@ -1504,7 +1504,7 @@
+ 	unsigned int barrier_fail;
+ 	unsigned int epoch_fail;  
+ 	unsigned int tx_id;       
+-	s64 op_intv[5];           
++	s64 op_intv[7];           
+ 	ktime_t start;            
+ 	void *tx;                 
+ 	
+--- ./include/linux/jbd2.h	2023-01-25 11:39:51.870788584 +0900
++++ /home/oslab/fast_commit/kernel/5_18_18_barrier/./include/linux/jbd2.h	2023-05-04 14:52:28.231898820 +0900
+@@ -803,6 +803,8 @@
+ 	/* CJFS */
+ 	struct transaction_stats_s stats;
+ 	int 			seq;
++	
++	int			t_flush_trigger;
+ };
+ 
+ static inline unsigned long
+@@ -1303,6 +1305,9 @@
+ 	int			(*j_submit_inode_data_buffers)
+ 					(struct jbd2_inode *);
+ 
++	int			(*j_dispatch_inode_data_buffers)
++					(struct jbd2_inode *);
++
+ 	/**
+ 	 * @j_finish_inode_data_buffers:
+ 	 *
+@@ -1671,6 +1676,8 @@
+ 			loff_t length);
+ extern int	   jbd2_journal_submit_inode_data_buffers(
+ 			struct jbd2_inode *jinode);
++extern int	   jbd2_journal_dispatch_inode_data_buffers(
++			struct jbd2_inode *jinode);
+ extern int	   jbd2_journal_finish_inode_data_buffers(
+ 			struct jbd2_inode *jinode);
+ extern int	   jbd2_journal_begin_ordered_truncate(journal_t *journal,
+@@ -1746,10 +1753,13 @@
+ 
+ int jbd2_log_start_commit(journal_t *journal, tid_t tid);
+ int __jbd2_log_start_commit(journal_t *journal, tid_t tid);
++int jbd2_log_start_dispatch(journal_t *journal, tid_t tid);
++int __jbd2_log_start_dispatch(journal_t *journal, tid_t tid);
+ int jbd2_journal_start_commit(journal_t *journal, tid_t *tid);
+ int jbd2_log_wait_commit(journal_t *journal, tid_t tid);
+ int jbd2_transaction_committed(journal_t *journal, tid_t tid);
+ int jbd2_complete_transaction(journal_t *journal, tid_t tid);
++int jbd2_dispatch_transaction(journal_t *journal, tid_t tid);
+ int jbd2_log_do_checkpoint(journal_t *journal);
+ int jbd2_trans_will_send_data_barrier(journal_t *journal, tid_t tid);
+ 
+--- ./include/linux/journal-head.h	2023-05-03 19:41:36.702018027 +0900
++++ /home/oslab/fast_commit/kernel/5_18_18_barrier/./include/linux/journal-head.h	2023-05-05 12:47:12.855892565 +0900
+@@ -13,11 +13,11 @@
  
  /* CJFS */
  #define OP_COALESCING 1 
--#define	MAX_JH_VERSION	5	
-+#define	MAX_JH_VERSION	5
- #define COMPOUND_FLUSH 5	
- #define PSP 
- #define DEBUG_PROC_OP
+-#define MAX_JH_VERSION 1
+-// #define COMPOUND_FLUSH 5
+-// #define PSP 
+-// #define DEBUG_PROC_OP
+-// #define DEBUG_FSYNC_LATENCY
++#define MAX_JH_VERSION 5
++#define COMPOUND_FLUSH 5
++#define PSP 
++#define DEBUG_PROC_OP
++#define DEBUG_FSYNC_LATENCY

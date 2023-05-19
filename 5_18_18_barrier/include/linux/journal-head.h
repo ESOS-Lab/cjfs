@@ -13,11 +13,11 @@
 
 /* CJFS */
 #define OP_COALESCING 1 
-#define MAX_JH_VERSION 1
-// #define COMPOUND_FLUSH 5
-// #define PSP 
-// #define DEBUG_PROC_OP
-// #define DEBUG_FSYNC_LATENCY
+#define MAX_JH_VERSION 5
+#define COMPOUND_FLUSH 5
+#define PSP 
+#define DEBUG_PROC_OP
+#define DEBUG_FSYNC_LATENCY
 
 #include <linux/spinlock.h>
 

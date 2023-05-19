@@ -42,6 +42,8 @@
 #include <linux/sched/sysctl.h>
 #include <linux/blk-crypto.h>
 
+#include <linux/jbd2.h>
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/block.h>
 
@@ -1282,44 +1284,32 @@ void blk_request_dispatched(struct request *req)
 {
 	struct bio *req_bio;
 	
-	if (!req->__data_len || !(req->cmd_bflags & REQ_ORDERED))
+	if (!blk_rq_bytes(req) && (req_op(req) != REQ_OP_WRITE))
 		return;
 
 	req_bio = req->bio;
 
 	while (req_bio) {
-		int i;
 		struct bio *bio = req_bio;
-
-		if (req->cmd_bflags & REQ_ORDERED) {
-			if (bio->bi_epoch) {
-				struct epoch *epoch;
-				epoch = bio->bi_epoch;
-				bio->bi_epoch = NULL;
-				epoch->complete++;
-				put_epoch(epoch);
-				if (atomic_read(&epoch->e_count) < 0) {
-					printk(KERN_INFO "[SWDBG] (%s) bio : %p next_bio : %p epoch : %p count : %d tid : %d\n"
-					,__func__, (void *) bio, (void *) bio->bi_next, 
-					(void *) epoch, 
-					atomic_read(&epoch->e_count), epoch->task->pid);
-				}
-				if (atomic_read(&epoch->e_count) == 0)
-					mempool_free(epoch, epoch->q->epoch_pool);
-			}
+		dispatch_bio_bh(bio);
+		req_bio = bio->bi_next;
 		}
 
-		for (i = bio->bi_iter.bi_idx; i < bio->bi_vcnt; i++) {                
-			struct bio_vec *bvec = &bio->bi_io_vec[i];
-			struct page *page = bvec->bv_page;        
-			if (page && PageDispatch(page))                               
+	req_bio = req->bio;
+
+	while (req_bio && req_bio->bi_opf & REQ_SYNC && req_bio->bi_io_vec) {
+		struct bio *bio = req_bio;
+		struct bvec_iter iter = bio->bi_iter;
+		struct bio_vec bvl;
+
+		for (;iter.bi_size && (bvl = mp_bvec_iter_bvec((bio->bi_io_vec), iter), 1); 
+			bio_advance_iter_single(bio, &iter, PAGE_SIZE)) {
+			
+			struct page *page = bvl.bv_page + ((bvl.bv_offset) >> PAGE_SHIFT);
+			if (page) 
 				end_page_dispatch(page);          
 		}       
 
-		if (dispatch_bio_bh(bio)) {
-			req_bio = bio->bi_next;
-			continue;              
-		}
 		req_bio = bio->bi_next;        
 	}
 }

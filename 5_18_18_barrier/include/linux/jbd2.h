@@ -803,6 +803,8 @@ struct transaction_s
 	/* CJFS */
 	struct transaction_stats_s stats;
 	int 			seq;
+	
+	int			t_flush_trigger;
 };
 
 static inline unsigned long
@@ -1303,6 +1305,9 @@ struct journal_s
 	int			(*j_submit_inode_data_buffers)
 					(struct jbd2_inode *);
 
+	int			(*j_dispatch_inode_data_buffers)
+					(struct jbd2_inode *);
+
 	/**
 	 * @j_finish_inode_data_buffers:
 	 *
@@ -1671,6 +1676,8 @@ extern int	   jbd2_journal_inode_ranged_wait(handle_t *handle,
 			loff_t length);
 extern int	   jbd2_journal_submit_inode_data_buffers(
 			struct jbd2_inode *jinode);
+extern int	   jbd2_journal_dispatch_inode_data_buffers(
+			struct jbd2_inode *jinode);
 extern int	   jbd2_journal_finish_inode_data_buffers(
 			struct jbd2_inode *jinode);
 extern int	   jbd2_journal_begin_ordered_truncate(journal_t *journal,
@@ -1746,10 +1753,13 @@ extern void	jbd2_clear_buffer_revoked_flags(journal_t *journal);
 
 int jbd2_log_start_commit(journal_t *journal, tid_t tid);
 int __jbd2_log_start_commit(journal_t *journal, tid_t tid);
+int jbd2_log_start_dispatch(journal_t *journal, tid_t tid);
+int __jbd2_log_start_dispatch(journal_t *journal, tid_t tid);
 int jbd2_journal_start_commit(journal_t *journal, tid_t *tid);
 int jbd2_log_wait_commit(journal_t *journal, tid_t tid);
 int jbd2_transaction_committed(journal_t *journal, tid_t tid);
 int jbd2_complete_transaction(journal_t *journal, tid_t tid);
+int jbd2_dispatch_transaction(journal_t *journal, tid_t tid);
 int jbd2_log_do_checkpoint(journal_t *journal);
 int jbd2_trans_will_send_data_barrier(journal_t *journal, tid_t tid);
 

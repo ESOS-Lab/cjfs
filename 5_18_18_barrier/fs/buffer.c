@@ -80,8 +80,7 @@ EXPORT_SYMBOL(__lock_buffer);
 /* UFS */
 void __lock_buffer_dispatch(struct buffer_head *bh)
 {
-	wait_on_bit_lock_action(&bh->b_state, BH_Dispatch,
-		       	sleep_on_buffer, TASK_UNINTERRUPTIBLE);
+	wait_on_bit_lock_io(&bh->b_state, BH_Dispatch, TASK_UNINTERRUPTIBLE);
 }
 EXPORT_SYMBOL(__lock_buffer_dispatch);
 
@@ -142,7 +141,7 @@ EXPORT_SYMBOL(__wait_on_buffer);
 /* UFS */
 void __wait_on_buffer_dispatch(struct buffer_head * bh)
 {
-	wait_on_bit_action(&bh->b_state, BH_Dispatch, sleep_on_buffer, TASK_UNINTERRUPTIBLE);
+	wait_on_bit_io(&bh->b_state, BH_Dispatch, TASK_UNINTERRUPTIBLE);
 }
 EXPORT_SYMBOL(__wait_on_buffer_dispatch);
 
@@ -3069,7 +3068,6 @@ static int submit_bh_wbc(int op, int op_flags, struct buffer_head *bh,
 		wbc_account_cgroup_owner(wbc, bh->b_page, bh->b_size);
 	}
 
-	lock_buffer_dispatch(bh);
 	submit_bio(bio);
 	return 0;
 }
@@ -3084,9 +3082,14 @@ EXPORT_SYMBOL(submit_bh);
 int dispatch_bio_bh(struct bio *bio)
 {
 	if ((bio->bi_end_io == end_bio_bh_io_sync) && bio->bi_private) {
-		// struct buffer_head *bh = bio->bi_private;
+		struct buffer_head *bh = bio->bi_private;
 		
-		wake_up_buffer_dispatch(bio->bi_private);
+		/* if (buffer_dispatch(bh)) {
+			printk(KERN_INFO "[SWDBG] (%s) blocknr : %llu\n"
+				,__func__, bh->b_blocknr);
+		} */
+		
+		wake_up_buffer_dispatch(bh);
 		return 1;
 	}
 	return 0;

@@ -34,6 +34,10 @@ static void journal_end_buffer_io_sync(struct buffer_head *bh, int uptodate)
 	struct buffer_head *orig_bh = bh->b_private;
 
 	BUFFER_TRACE(bh, "");
+	
+	// printk(KERN_INFO "[SWDBG] (%s) blocknr : %llu\n"
+	//	,__func__, bh->b_blocknr);
+
 	if (uptodate)
 		set_buffer_uptodate(bh);
 	else
@@ -147,15 +151,16 @@ static int journal_submit_commit_record(journal_t *journal,
 
 	BUFFER_TRACE(bh, "submit commit block");
 	lock_buffer(bh);
+	lock_buffer_dispatch(bh);
 	clear_buffer_dirty(bh);
 	set_buffer_uptodate(bh);
 	bh->b_end_io = journal_end_buffer_io_sync;
 				
+	// printk(KERN_INFO "[SWDBG] (%s) commit block number : %llu\n"
+	//		,__func__, bh->b_blocknr);
+				
 	if (journal->j_flags & JBD2_BARRIER &&
 	    !jbd2_has_feature_async_commit(journal))
-		ret = submit_bh(REQ_OP_WRITE,
-			REQ_SYNC | REQ_ORDERED | REQ_BARRIER, bh);
-	else
 		ret = submit_bh(REQ_OP_WRITE, REQ_SYNC, bh);
 
 	*cbh = bh;
@@ -181,13 +186,10 @@ static int journal_wait_on_commit_record(journal_t *journal,
 	return ret;
 }
 
-/* UFS : Wrapping Function of dispatch checking of Journal Commit Record */
-static int journal_wait_on_dispatch_of_commit_record(journal_t *journal,
+static void journal_dispatch_on_commit_record(journal_t *journal,
 					 struct buffer_head *bh)
 {
 	wait_on_buffer_dispatch(bh);
-
-	return 0;
 }
 
 /*
@@ -276,6 +278,15 @@ static int journal_submit_data_buffers(journal_t *journal,
 	return ret;
 }
 
+int jbd2_journal_dispatch_inode_data_buffers(struct jbd2_inode *jinode)
+{
+	struct address_space *mapping = jinode->i_vfs_inode->i_mapping;
+
+	return filemap_fdatadispatch_range_keep_errors(mapping,
+						   jinode->i_dirty_start,
+						   jinode->i_dirty_end);
+}
+
 int jbd2_journal_finish_inode_data_buffers(struct jbd2_inode *jinode)
 {
 	struct address_space *mapping = jinode->i_vfs_inode->i_mapping;
@@ -329,6 +340,35 @@ static int journal_finish_inode_data_buffers(journal_t *journal,
 			jinode->i_dirty_start = 0;
 			jinode->i_dirty_end = 0;
 		}
+	}
+	spin_unlock(&journal->j_list_lock);
+
+	return ret;
+}
+
+static int journal_dispatch_inode_data_buffers(journal_t *journal,
+		transaction_t *commit_transaction)
+{
+	struct jbd2_inode *jinode, *next_i;
+	int err, ret = 0;
+
+	/* For locking, see the comment in journal_submit_data_buffers() */
+	spin_lock(&journal->j_list_lock);
+	list_for_each_entry(jinode, &commit_transaction->t_inode_list, i_list) {
+		if (!(jinode->i_flags & JI_WAIT_DATA))
+			continue;
+		jinode->i_flags |= JI_COMMIT_RUNNING;
+		spin_unlock(&journal->j_list_lock);
+		/* wait for the inode data buffers writeout. */
+		if (journal->j_finish_inode_data_buffers) {
+			err = journal->j_finish_inode_data_buffers(jinode);
+			if (!ret)
+				ret = err;
+		}
+		spin_lock(&journal->j_list_lock);
+		jinode->i_flags &= ~JI_COMMIT_RUNNING;
+		smp_mb();
+		wake_up_bit(&jinode->i_flags, __JI_COMMIT_RUNNING);
 	}
 	spin_unlock(&journal->j_list_lock);
 
@@ -1225,7 +1265,7 @@ restart_loop:
 
 #ifdef DEBUG_PROC_OP
 typedef struct {
-	s64 op_intv[5];
+	s64 op_intv[7];
 } op_data; 
 extern op_data op_array[4000000];
 extern atomic_t op_index;
@@ -1275,18 +1315,13 @@ void jbd2_journal_barrier_commit_transaction(journal_t *journal)
 	struct blk_plug plug;
 	/* Tail of the journal */
 	int csum_size = 0;
-	/* UFS */
-	LIST_HEAD(t_io_bufs);
-	LIST_HEAD(t_log_bufs);
 	/* CJFS */
 	int ver_tid;
-	ktime_t start, dispatch_start, c_wait_start;
+	struct list_head *pos = NULL;
 	int seq;
 
 	if (jbd2_journal_has_csum_v2or3(journal))
 		csum_size = sizeof(struct jbd2_journal_block_tail);
-
-	// commit_transaction->t_commit_start_time = ktime_get();
 
 	/*
 	 * First job: lock down the current transaction and wait for
@@ -1341,9 +1376,8 @@ void jbd2_journal_barrier_commit_transaction(journal_t *journal)
 	commit_transaction = journal->j_running_transaction;
 	ver_tid = commit_transaction->t_tid % MAX_JH_VERSION;
 
-	// commit_transaction->t_commit_start_time = ktime_get();
 #ifdef DEBUG_PROC_OP
-	c_wait_start = ktime_get();
+	commit_transaction->t_commit_start_time = ktime_get();
 #endif
 
 #ifdef OP_COALESCING
@@ -1358,8 +1392,6 @@ op_coalescing:
 	}
 	read_unlock(&journal->j_state_lock);
 #endif
-
-	start = ktime_get();
 
 	trace_jbd2_start_commit(journal, commit_transaction);
 	jbd_debug(1, "JBD2: starting commit of transaction %d\n",
@@ -1413,19 +1445,13 @@ op_coalescing:
 	}
 	write_lock(&journal->j_state_lock);
 #endif
+
 #ifdef DEBUG_PROC_OP
 	seq = atomic_add_return(1, &op_index);
 	commit_transaction->seq = seq;
 	op_array[seq - 1].op_intv[0] = 
-		commit_transaction->t_tid;
-	op_array[seq - 1].op_intv[1] = 
-		atomic_read(&commit_transaction->t_pconflict_count);
-	op_array[seq - 1].op_intv[2] = 
-		ktime_to_ns(ktime_sub(ktime_get(), c_wait_start));
-	// seq = atomic_add_return(1, &cc_index);
-	// cc_array[seq - 1].cc_intv[0] = atomic_read(&commit_transaction->t_pconflict_count);
+                ktime_to_ns(ktime_sub(ktime_get(), commit_transaction->t_commit_start_time));
 #endif
-
 	/*
 	 * First thing we are allowed to do is to discard any remaining
 	 * BJ_Reserved buffers.  Note, it is _not_ permissible to assume
@@ -1517,7 +1543,8 @@ op_coalescing:
 		jbd2_journal_abort(journal, err);
 
 	blk_start_plug(&plug);
-	jbd2_journal_write_revoke_records(commit_transaction, &t_log_bufs);
+	jbd2_journal_write_revoke_records(commit_transaction,
+	                                  &commit_transaction->t_log_bufs);
 
 	jbd_debug(3, "JBD2: commit phase 2b\n");
 
@@ -1544,7 +1571,6 @@ op_coalescing:
 	err = 0;
 	bufs = 0;
 	descriptor = NULL;
-	dispatch_start = ktime_get();
 	while (commit_transaction->t_buffers) {
 
 		/* Find the next buffer to be journaled... */
@@ -1601,7 +1627,7 @@ op_coalescing:
 			/* Record it so that we can wait for IO
                            completion later */
 			BUFFER_TRACE(descriptor, "ph3: file as descriptor");
-			jbd2_file_log_bh(&t_log_bufs, descriptor);
+			jbd2_file_log_bh(&commit_transaction->t_log_bufs, descriptor);
 		}
 
 		/* Where is the buffer to be written? */
@@ -1632,16 +1658,13 @@ op_coalescing:
 		 */
 		set_bit(BH_JWrite, &jh2bh(jh)->b_state);
 		JBUFFER_TRACE(jh, "ph3: write metadata");
-		// seq = atomic_add_return(1, &op_index);
-		start = ktime_get();
 		flags = jbd2_journal_write_metadata_buffer(commit_transaction,
 						jh, &wbuf[bufs], blocknr);
-		// op_array[seq - 1].op_intv[0] = ktime_to_ns(ktime_sub(ktime_get(),start));
 		if (flags < 0) {
 			jbd2_journal_abort(journal, flags);
 			continue;
 		}
-		jbd2_file_log_bh(&t_io_bufs, wbuf[bufs]);
+		jbd2_file_log_bh(&commit_transaction->t_io_bufs, wbuf[bufs]);
 
 		/* Record the new block's tag in the current descriptor
                    buffer */
@@ -1699,21 +1722,13 @@ start_journal_io:
 				}
 
 				lock_buffer(bh);
+				lock_buffer_dispatch(bh);
 				clear_buffer_dirty(bh);
 				set_buffer_uptodate(bh);
 				bh->b_end_io = journal_end_buffer_io_sync;
-				// submit_bh(REQ_OP_WRITE, REQ_SYNC, bh);
-				/* UFS */
-				bh->b_tx = bh->b_tx == NULL ? commit_transaction : bh->b_tx;
-				if (commit_transaction->t_buffers != NULL) {
-					submit_bh(REQ_OP_WRITE, REQ_SYNC | REQ_ORDERED, bh);
-				} else if (i == bufs - 1 
-						&& commit_transaction->t_buffers == NULL) {
-					submit_bh(REQ_OP_WRITE, 
-						REQ_SYNC | REQ_ORDERED | REQ_BARRIER, bh);
-				} else {
-					submit_bh(REQ_OP_WRITE, REQ_SYNC | REQ_ORDERED, bh);
-				}
+				submit_bh(REQ_OP_WRITE, REQ_SYNC, bh);
+				// printk(KERN_INFO "[SWDBG] (%s) blocknr : %llu\n"
+				//	,__func__, bh->b_blocknr);
 			}
 			cond_resched();
 
@@ -1724,19 +1739,63 @@ start_journal_io:
 		}
 	}
 
+        blk_finish_plug(&plug);
+        
 #ifdef DEBUG_PROC_OP
-	// op_array[seq - 1].op_intv[1] = ktime_to_ns(ktime_sub(ktime_get(), dispatch_start));
+	op_array[seq - 1].op_intv[1] =
+                ktime_to_ns(ktime_sub(ktime_get(), commit_transaction->t_commit_start_time));
 #endif
 
-	err = journal_finish_inode_data_buffers(journal, commit_transaction);
+	err = journal_dispatch_inode_data_buffers(journal, commit_transaction);
+        
 	if (err) {
 		printk(KERN_WARNING
-			"JBD2: Detected IO errors while flushing file data "
+                        "JBD2: Detected IO errors while dispatching file data "
 		       "on %s\n", journal->j_devname);
 		if (journal->j_flags & JBD2_ABORT_ON_SYNCDATA_ERR)
 			jbd2_journal_abort(journal, err);
 		err = 0;
 	}
+
+        pos = NULL;
+        list_for_each (pos, &commit_transaction->t_io_bufs) {
+                struct buffer_head *bh = list_entry(pos, struct buffer_head,
+                                                    b_assoc_buffers);
+                wait_on_buffer_dispatch(bh);
+
+        }
+
+        pos = NULL;
+        list_for_each (pos, &commit_transaction->t_log_bufs) {
+                struct buffer_head *bh = list_entry(pos, struct buffer_head,
+                                                    b_assoc_buffers);
+                wait_on_buffer_dispatch(bh);
+
+        }
+
+#ifdef DEBUG_PROC_OP
+	op_array[seq - 1].op_intv[2] =
+                ktime_to_ns(ktime_sub(ktime_get(), commit_transaction->t_commit_start_time));
+#endif
+	
+	err = journal_submit_commit_record(journal, commit_transaction,
+                                         &commit_transaction->t_cbh, 
+					 &commit_transaction->t_crc32_sum);
+        if (err)
+                jbd2_journal_abort(journal, err);
+
+#ifdef DEBUG_PROC_OP
+	op_array[seq - 1].op_intv[3] =
+                ktime_to_ns(ktime_sub(ktime_get(), commit_transaction->t_commit_start_time));
+#endif
+
+        if (commit_transaction->t_cbh)
+                wait_on_buffer_dispatch(commit_transaction->t_cbh);
+
+#ifdef DEBUG_PROC_OP
+	op_array[seq - 1].op_intv[4] =
+                ktime_to_ns(ktime_sub(ktime_get(), commit_transaction->t_commit_start_time));
+#endif
 
 	/*
 	 * Get current oldest transaction in the log before we issue flush
@@ -1783,48 +1842,6 @@ start_journal_io:
 			jbd2_journal_abort(journal, err);
 	}
 
-	blk_finish_plug(&plug);
-
-	/*
-	 * Here, we wait for the completion of dispatch. Because we don't have
-	 * an order-preserving block layer yet, I commented this code out now.
-	 * If the order-preserving block layer is implemented, We can
-	 * uncomment this code.
-	 * - 2022. 8. 26. Joontaek Oh.
-	 */
-
-	while (!list_empty(&t_io_bufs)) {
-		struct buffer_head *bh = list_entry(t_io_bufs.prev,
-		       				    struct buffer_head,
-		       			 	    b_assoc_buffers);
-		wait_on_buffer_dispatch(bh);
-
-		jbd2_unfile_log_bh(bh);
-		jbd2_file_log_bh(&commit_transaction->t_io_bufs, bh);
-	}
-
-	while (!list_empty(&t_log_bufs)) {
-		struct buffer_head *bh = list_entry(t_log_bufs.prev,
-		                		    struct buffer_head, 
-						    b_assoc_buffers);
-		wait_on_buffer_dispatch(bh);
-		jbd2_unfile_log_bh(bh);
-		jbd2_file_log_bh(&commit_transaction->t_log_bufs, bh);
-	}
-
-	if (!jbd2_has_feature_async_commit(journal)) {
-		err = journal_submit_commit_record(journal, commit_transaction,
-		                              &commit_transaction->t_cbh,
-		                              commit_transaction->t_crc32_sum);
-		if (err)
-			jbd2_journal_abort(journal, err);
-	}
-
-	/* UFS */
-	if (commit_transaction->t_cbh)
-		err = journal_wait_on_dispatch_of_commit_record(journal, 
-				commit_transaction->t_cbh);
-
 	/*
 	 * Insert the committing transaction into the flush transaction list.
 	 * The flush thead will get the committing transaction and flush it.
@@ -1847,53 +1864,10 @@ start_journal_io:
 	}
 	spin_unlock(&journal->j_list_lock);
 
-
-	/* Done with this transaction! */
 	write_lock(&journal->j_state_lock);
-	jbd_debug(3, "JBD2: commit phase 7\n");
-
-	commit_transaction->t_start = jiffies;
-	commit_transaction->stats.run.rs_logging = jbd2_time_diff(commit_transaction->stats.
-						run.rs_logging,
-					      commit_transaction->t_start);
-
-	/*
-	 * File the transaction statistics
-	 */
-	commit_transaction->stats.ts_tid = commit_transaction->t_tid;
-	commit_transaction->stats.run.rs_handle_count =
-		atomic_read(&commit_transaction->t_handle_count);
-	trace_jbd2_run_stats(journal->j_fs_dev->bd_dev,
-			     commit_transaction->t_tid, &commit_transaction->stats.run);
-	commit_transaction->stats.ts_requested = (commit_transaction->t_requested) ? 1 : 0;
-
-	J_ASSERT(commit_transaction == journal->j_committing_transaction);
 	journal->j_commit_sequence = commit_transaction->t_tid;
 	journal->j_committing_transaction = NULL;
-	// commit_time = ktime_to_ns(ktime_sub(ktime_get(), commit_transaction->start_time));
-
-	/*
-	 * weight the commit time higher than the average time so we don't
-	 * react too strongly to vast changes in the commit time
-	 */
-	/* CJFS
-	if (likely(journal->j_average_commit_time))
-		journal->j_average_commit_time = (commit_time +
-				journal->j_average_commit_time*3) / 4;
-	else
-		journal->j_average_commit_time = commit_time;
-	*/
-
 	write_unlock(&journal->j_state_lock);
-
-	if (journal->j_commit_callback)
-		journal->j_commit_callback(journal, commit_transaction);
-	if (journal->j_fc_cleanup_callback)
-		journal->j_fc_cleanup_callback(journal, 1, commit_transaction->t_tid);
-
-	trace_jbd2_end_commit(journal, commit_transaction);
-	jbd_debug(1, "JBD2: commit %d complete, head %d\n",
-		  journal->j_commit_sequence, journal->j_tail_sequence);
 }
 
 /*
@@ -1919,7 +1893,7 @@ void jbd2_journal_barrier_flush_transaction(journal_t *journal)
 	int commit_empty;
 #endif
 	/* CJFS */
-	int ver_tid, seq;
+	int ver_tid;
 
 	/*
 	 * Bring the committing transaction which has been processed
@@ -1939,8 +1913,6 @@ void jbd2_journal_barrier_flush_transaction(journal_t *journal)
 	commit_empty = journal->j_flushing_transactions 
 		== commit_transaction->t_flushnext ? 1 : 0;
 #endif
-	// printk(KERN_INFO "[SWDBG] (%s) tid : %d flush_tid : %d, commit_emtpy : %d\n"
-	//		,__func__, commit_transaction->t_tid, flush_tid, commit_empty);
 	spin_unlock(&journal->j_list_lock);
 	
 	/* Lo and behold: we have just managed to send a transaction to
@@ -1955,6 +1927,17 @@ void jbd2_journal_barrier_flush_transaction(journal_t *journal)
 	*/
 
 	jbd_debug(3, "JBD2: commit phase 3\n");
+
+	err = journal_finish_inode_data_buffers(journal, commit_transaction);
+        
+	if (err) {
+                printk(KERN_WARNING
+                        "JBD2: Detected IO errors while dispatching file data "
+                       "on %s\n", journal->j_devname);
+                if (journal->j_flags & JBD2_ABORT_ON_SYNCDATA_ERR)
+                        jbd2_journal_abort(journal, err);
+                err = 0;
+        }
 
 	while (!list_empty(&commit_transaction->t_io_bufs)) {
 		struct buffer_head *bh =
@@ -2023,6 +2006,11 @@ void jbd2_journal_barrier_flush_transaction(journal_t *journal)
 	if (err)
 		jbd2_journal_abort(journal, err);
 
+#ifdef DEBUG_PROC_OP
+	op_array[commit_transaction->seq - 1].op_intv[5] =
+                ktime_to_ns(ktime_sub(ktime_get(), commit_transaction->t_commit_start_time));
+#endif
+
 	jbd_debug(3, "JBD2: commit phase 5\n");
 	write_lock(&journal->j_state_lock);
 	J_ASSERT(commit_transaction->t_state == T_COMMIT_DFLUSH);
@@ -2030,31 +2018,30 @@ void jbd2_journal_barrier_flush_transaction(journal_t *journal)
 	write_unlock(&journal->j_state_lock);
 
 	if (commit_transaction->t_cbh)
-		err = journal_wait_on_commit_record(journal, commit_transaction->t_cbh);
+		err = journal_wait_on_commit_record(journal, 
+					commit_transaction->t_cbh);
 	commit_transaction->stats.run.rs_blocks_logged++;
 #ifdef COMPOUND_FLUSH
-	//printk(KERN_INFO "[SWDBG] (%s) tid : %d, flush_tid : %d, commit_emtpy : %d\n"
-	//	,__func__, commit_transaction->t_tid, flush_tid, commit_empty);
+	/*
+	 * Compound Flush should be modified because we removed order-preserving
+	 * mechanism from this branch. In Compoud Flush, when a flush command is
+	 * not needed, the flush command in the write command of the commit block
+	 * has to be removed, not the single command below.
+	 * - Joontaek Oh.
+	 */
 	if ((journal->j_flags & JBD2_BARRIER) 
+		&& commit_transaction->t_flush_trigger
 		&& (flush_tid == 0 || commit_empty == 1)) {
-		blkdev_issue_flush(journal->j_dev);
-		// printk(KERN_INFO "[SWDBG] (%s) tid : %d, wait on flush ! flush_tid : %d, commit_emtpy : %d\n"
-		//	,__func__, commit_transaction->t_tid, flush_tid, commit_empty);
-	}
-#ifdef DEBUG_PROC_OP
-	seq = commit_transaction->seq;
-	op_array[seq - 1].op_intv[3] = 
-		commit_transaction->stats.run.rs_blocks;
-	op_array[seq - 1].op_intv[4] = 
-		((journal->j_flags & JBD2_BARRIER) && (flush_tid == 0 || commit_empty == 1)) ? 1 : 0;
-#endif
-#else
-	if (journal->j_flags & JBD2_BARRIER) {
 		blkdev_issue_flush(journal->j_dev);
 	}
 #endif
 	if (err)
 		jbd2_journal_abort(journal, err);
+
+/* #ifdef DEBUG_PROC_OP
+	op_array[commit_transaction->seq - 1].op_intv[5] =
+                ktime_to_ns(ktime_sub(ktime_get(), commit_transaction->t_commit_start_time));
+#endif */
 
 	WARN_ON_ONCE(
 		atomic_read(&commit_transaction->t_outstanding_credits) < 0);
@@ -2154,7 +2141,6 @@ restart_loop:
 		 * since the buffer may be still accessible when blocksize <
 		 * pagesize and it is attached to the last partial page.
 		 */
-		/* CJFS */
 		if (buffer_freed(bh) && jh->b_ver_count == 1) {
 			struct address_space *mapping;
 
@@ -2232,9 +2218,11 @@ restart_loop:
 	}
 #ifdef COMPOUND_FLUSH	
 	journal->j_transfer_sequence = commit_transaction->t_tid;
-	if (flush_tid == 0 || commit_empty == 1) 
+	if (commit_transaction->t_flush_trigger && 
+		(flush_tid == 0 || commit_empty == 1)) 
 		journal->j_flush_sequence = commit_transaction->t_tid;
 #else
+	if (commit_transaction->t_flush_trigger)
 	journal->j_flush_sequence = commit_transaction->t_tid;
 #endif
 
@@ -2256,7 +2244,58 @@ restart_loop:
 				commit_transaction;
 	}
 	spin_unlock(&journal->j_list_lock);
+
+	/* Done with this transaction! */
+
+	jbd_debug(3, "JBD2: commit phase 7\n");
+
+	J_ASSERT(commit_transaction->t_state == T_COMMIT_JFLUSH);
+
+	commit_transaction->t_start = jiffies;
+	commit_transaction->stats.run.rs_logging = jbd2_time_diff(commit_transaction->stats.
+						run.rs_logging, commit_transaction->t_start);
+
+	/*
+	 * File the transaction statistics
+	 */
+	commit_transaction->stats.ts_tid = commit_transaction->t_tid;
+	commit_transaction->stats.run.rs_handle_count =
+		atomic_read(&commit_transaction->t_handle_count);
+	trace_jbd2_run_stats(journal->j_fs_dev->bd_dev,
+			     commit_transaction->t_tid, &commit_transaction->stats.run);
+	commit_transaction->stats.ts_requested = (commit_transaction->t_requested) ? 1 : 0;
+
+	commit_transaction->t_state = T_COMMIT_CALLBACK;
+
+	J_ASSERT(commit_transaction == journal->j_flushing_transactions);
+	commit_transaction->commit_time = ktime_to_ns(ktime_sub(ktime_get(),
+	                                         commit_transaction->t_commit_start_time));
+
+	/*
+	 * weight the commit time higher than the average time so we don't
+	 * react too strongly to vast changes in the commit time
+	 */
+	if (likely(journal->j_average_commit_time))
+		journal->j_average_commit_time = (commit_transaction->commit_time +
+				journal->j_average_commit_time*3) / 4;
+	else
+		journal->j_average_commit_time = commit_transaction->commit_time;
+
 	write_unlock(&journal->j_state_lock);
+
+	if (journal->j_commit_callback)
+		journal->j_commit_callback(journal, commit_transaction);
+	if (journal->j_fc_cleanup_callback)
+		journal->j_fc_cleanup_callback(journal, 1, commit_transaction->t_tid);
+
+	trace_jbd2_end_commit(journal, commit_transaction);
+	jbd_debug(1, "JBD2: commit %d complete, head %d\n",
+		  journal->j_flush_sequence, journal->j_tail_sequence);
+
+#ifdef DEBUG_PROC_OP
+	op_array[commit_transaction->seq - 1].op_intv[6] =
+                ktime_to_ns(ktime_sub(ktime_get(), commit_transaction->t_commit_start_time));
+#endif
 
 	write_lock(&journal->j_state_lock);
 	journal->j_flags &= ~JBD2_FULL_COMMIT_ONGOING;
@@ -2270,19 +2309,10 @@ restart_loop:
 		jbd2_journal_free_transaction(commit_transaction);
 	}
 	spin_unlock(&journal->j_list_lock);
-
-	commit_transaction->commit_time = ktime_to_ns(ktime_sub(ktime_get(), 
-				commit_transaction->t_commit_start_time));
-	
-	if (likely(journal->j_average_commit_time))
-		journal->j_average_commit_time = (commit_transaction->commit_time +
-				journal->j_average_commit_time*3) / 4;
-	else
-		journal->j_average_commit_time = commit_transaction->commit_time;
-	
 	write_unlock(&journal->j_state_lock);
 	wake_up(&journal->j_wait_done_commit);
 	wake_up(&journal->j_fc_wait);
+
 	/*
 	 * Calculate overall stats
 	 */
@@ -2313,5 +2343,4 @@ restart_loop:
 	if (journal->j_flushing_transactions == commit_transaction)
 		journal->j_flushing_transactions = NULL;
 	spin_unlock(&journal->j_list_lock);
-	
 }

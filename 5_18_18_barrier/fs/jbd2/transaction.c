@@ -134,6 +134,7 @@ static void jbd2_get_transaction(journal_t *journal,
 	transaction->t_max_wait = 0;
 	transaction->t_start = jiffies;
 	transaction->t_requested = 0;
+	transaction->t_flush_trigger = 0;
 }
 
 /*

@@ -1751,8 +1751,6 @@ static blk_status_t scsi_queue_rq(struct blk_mq_hw_ctx *hctx,
 
 	/* UFS */                   
 	blk_mq_dispatch_request(req);
-	blk_request_dispatched(req);
-
 	return BLK_STS_OK;
 
 out_dec_host_busy:

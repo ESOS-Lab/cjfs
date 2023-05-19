@@ -2898,23 +2898,6 @@ void blk_mq_submit_bio(struct bio *bio)
 	if (!bio_integrity_prep(bio))
 		return;
 
-	/* UFS */
-	if (bio->bi_opf & REQ_ORDERED) {
-		if (!current->__epoch) {
-			blk_start_epoch(q);
-		}
-	
-		get_epoch(current->__epoch);
-		bio->bi_epoch = current->__epoch;
-		bio->bi_epoch->pending++;
-		
-		if (bio->bi_opf & REQ_BARRIER 
-			&& ((bio->bi_end_io == bio_chain_endio && bio != parent) 
-			     || (!bio->bi_iter.bi_idx && bio == parent))) {
-			blk_finish_epoch();
-		}
-	}
-
 	rq = blk_mq_get_cached_request(q, plug, &bio, nr_segs);
 	if (!rq) {
 		if (!bio)

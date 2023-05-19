@@ -554,6 +554,16 @@ static int ext4_journal_submit_inode_data_buffers(struct jbd2_inode *jinode)
 	return ret;
 }
 
+static int ext4_journal_dispatch_inode_data_buffers(struct jbd2_inode *jinode)
+{
+	int ret = 0;
+
+	if (!ext4_should_journal_data(jinode->i_vfs_inode))
+		ret = jbd2_journal_dispatch_inode_data_buffers(jinode);
+
+	return ret;
+}
+
 static int ext4_journal_finish_inode_data_buffers(struct jbd2_inode *jinode)
 {
 	int ret = 0;
@@ -5281,6 +5291,8 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 
 	sbi->s_journal->j_submit_inode_data_buffers =
 		ext4_journal_submit_inode_data_buffers;
+	sbi->s_journal->j_dispatch_inode_data_buffers =
+		ext4_journal_dispatch_inode_data_buffers;
 	sbi->s_journal->j_finish_inode_data_buffers =
 		ext4_journal_finish_inode_data_buffers;
 
