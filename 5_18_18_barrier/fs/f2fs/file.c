@@ -385,11 +385,154 @@ out:
 	return ret;
 }
 
+/*
+ * This is fbarrier handler for F2FS. It is wrapped by f2fs_fbarrier_file.
+ * It is very similar with f2fs_do_sync_file. But it doesn't wait for DMA
+ * transfer (writeback) and doesn't call flush.
+ * - Joontaek Oh
+ */
+static int f2fs_do_fbarrier_file(struct file *file, loff_t start, loff_t end,
+						int datasync, bool atomic)
+{
+	struct inode *inode = file->f_mapping->host;
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+	nid_t ino = inode->i_ino;
+	int ret = 0;
+	enum cp_reason_type cp_reason = 0;
+	struct writeback_control wbc = {
+		.sync_mode = WB_SYNC_ALL,
+		.nr_to_write = LONG_MAX,
+		.for_reclaim = 0,
+	};
+	unsigned int seq_id = 0;
+
+	if (unlikely(f2fs_readonly(inode->i_sb)))
+		return 0;
+
+	trace_f2fs_sync_file_enter(inode);
+
+	if (S_ISDIR(inode->i_mode))
+		goto go_write;
+
+	/* if fdatasync is triggered, let's do in-place-update */
+	if (datasync || get_dirty_pages(inode) <= SM_I(sbi)->min_fsync_blocks)
+		set_inode_flag(inode, FI_NEED_IPU);
+	ret = filemap_fdatawrite_range(file->f_mapping, start, end);
+	filemap_fdatadispatch_range(file->f_mapping, start, end);
+	clear_inode_flag(inode, FI_NEED_IPU);
+
+	if (ret || is_sbi_flag_set(sbi, SBI_CP_DISABLED)) {
+		trace_f2fs_sync_file_exit(inode, cp_reason, datasync, ret);
+		return ret;
+	}
+
+	/* if the inode is dirty, let's recover all the time */
+	if (!f2fs_skip_inode_update(inode, datasync)) {
+		f2fs_write_inode(inode, NULL);
+		goto go_write;
+	}
+
+	/*
+	 * if there is no written data, don't waste time to write recovery info.
+	 */
+	if (!is_inode_flag_set(inode, FI_APPEND_WRITE) &&
+			!f2fs_exist_written_data(sbi, ino, APPEND_INO)) {
+
+		/* it may call write_inode just prior to fsync */
+		if (need_inode_page_update(sbi, ino))
+			goto go_write;
+
+		if (is_inode_flag_set(inode, FI_UPDATE_WRITE) ||
+				f2fs_exist_written_data(sbi, ino, UPDATE_INO))
+			goto flush_out;
+		goto out;
+	} else {
+		/*
+		 * for OPU case, during fsync(), node can be persisted before
+		 * data when lower device doesn't support write barrier, result
+		 * in data corruption after SPO.
+		 * So for strict fsync mode, force to use atomic write sematics
+		 * to keep write order in between data/node and last node to
+		 * avoid potential data corruption.
+		 */
+		if (F2FS_OPTION(sbi).fsync_mode ==
+				FSYNC_MODE_STRICT && !atomic)
+			atomic = true;
+	}
+go_write:
+	/*
+	 * Both of fdatasync() and fsync() are able to be recovered from
+	 * sudden-power-off.
+	 */
+	f2fs_down_read(&F2FS_I(inode)->i_sem);
+	cp_reason = need_do_checkpoint(inode);
+	f2fs_up_read(&F2FS_I(inode)->i_sem);
+
+	if (cp_reason) {
+		/* all the dirty node pages should be flushed for POR */
+		ret = f2fs_sync_fs(inode->i_sb, 1);
+
+		/*
+		 * We've secured consistency through sync_fs. Following pino
+		 * will be used only for fsynced inodes after checkpoint.
+		 */
+		try_to_fix_pino(inode);
+		clear_inode_flag(inode, FI_APPEND_WRITE);
+		clear_inode_flag(inode, FI_UPDATE_WRITE);
+		goto out;
+	}
+sync_nodes:
+	atomic_inc(&sbi->wb_sync_req[NODE]);
+	ret = f2fs_fsync_node_pages(sbi, inode, &wbc, atomic, &seq_id);
+	atomic_dec(&sbi->wb_sync_req[NODE]);
+	if (ret)
+		goto out;
+
+	/* if cp_error was enabled, we should avoid infinite loop */
+	if (unlikely(f2fs_cp_error(sbi))) {
+		ret = -EIO;
+		goto out;
+	}
+
+	if (f2fs_need_inode_block_update(sbi, ino)) {
+		f2fs_mark_inode_dirty_sync(inode, true);
+		f2fs_write_inode(inode, NULL);
+		goto sync_nodes;
+	}
+
+	/* once recovery info is written, don't need to tack this */
+	f2fs_remove_ino_entry(sbi, ino, APPEND_INO);
+	clear_inode_flag(inode, FI_APPEND_WRITE);
+flush_out:
+	if (!ret) {
+		f2fs_remove_ino_entry(sbi, ino, UPDATE_INO);
+		clear_inode_flag(inode, FI_UPDATE_WRITE);
+		f2fs_remove_ino_entry(sbi, ino, FLUSH_INO);
+	}
+	f2fs_update_time(sbi, REQ_TIME);
+out:
+	trace_f2fs_sync_file_exit(inode, cp_reason, datasync, ret);
+	return ret;
+}
+
+
 int f2fs_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
 {
 	if (unlikely(f2fs_cp_error(F2FS_I_SB(file_inode(file)))))
 		return -EIO;
 	return f2fs_do_sync_file(file, start, end, datasync, false);
+}
+
+/*
+ * This is the fbarrier handler for F2FS. It just calls f2fs_do_fbarrier_file.
+ * There is no special reason for barrier. I just followed original F2FS way.
+ * - Joontaek Oh
+ */
+int f2fs_fbarrier_file(struct file *file, loff_t start, loff_t end, int datasync)
+{
+	if (unlikely(f2fs_cp_error(F2FS_I_SB(file_inode(file)))))
+		return -EIO;
+	return f2fs_do_fbarrier_file(file, start, end, datasync, false);
 }
 
 static bool __found_offset(struct address_space *mapping, block_t blkaddr,
@@ -4751,4 +4894,5 @@ const struct file_operations f2fs_file_operations = {
 	.splice_read	= generic_file_splice_read,
 	.splice_write	= iter_file_splice_write,
 	.fadvise	= f2fs_file_fadvise,
+	.fbarrier	= f2fs_fbarrier_file,
 };
