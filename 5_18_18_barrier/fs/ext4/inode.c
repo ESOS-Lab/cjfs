@@ -175,6 +175,13 @@ void ext4_evict_inode(struct inode *inode)
 	int extra_credits = 6;
 	struct ext4_xattr_inode_array *ea_inode_array = NULL;
 	bool freeze_protected = false;
+#ifdef DEBUG_PROC_EXT4
+        struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
+        current->ext4_sbi = sbi;
+        current->ext4_op_trace |= DEBUG_TRACE_UNLINK;
+        current->ext4_op_seq = atomic_add_return(1, &sbi->unlink_index);
+        current->ext4_debug_start_time = ktime_get();
+#endif
 
 	trace_ext4_evict_inode(inode);
 
@@ -335,6 +342,11 @@ stop_handle:
 	if (freeze_protected)
 		sb_end_intwrite(inode->i_sb);
 	ext4_xattr_inode_array_free(ea_inode_array);
+#ifdef DEBUG_PROC_EXT4
+        sbi->unlink_latency_array[current->ext4_op_seq - 1].ext4_intv[0] =
+                ktime_sub(ktime_get(), current->ext4_debug_start_time);
+        current->ext4_op_trace &= ~DEBUG_TRACE_UNLINK;
+#endif
 	return;
 no_delete:
 	if (!list_empty(&EXT4_I(inode)->i_fc_list))

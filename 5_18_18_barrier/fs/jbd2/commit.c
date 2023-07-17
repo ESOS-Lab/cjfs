@@ -1280,13 +1280,17 @@ void jbd2_journal_barrier_commit_transaction(journal_t *journal)
 	LIST_HEAD(t_log_bufs);
 	/* CJFS */
 	int ver_tid;
-	ktime_t start, dispatch_start, c_wait_start;
-	int seq;
+	ktime_t start, dispatch_start;
+#ifdef DEBUG_PROC_OP
+        ktime_t debug_start_time, debug_shadow_copy_time = 0;
+        ktime_t start_copy = 0, end_copy = 0;
+        int seq;
+        debug_start_time = ktime_get();
+        seq = atomic_add_return(1, &op_index);
+#endif
 
 	if (jbd2_journal_has_csum_v2or3(journal))
 		csum_size = sizeof(struct jbd2_journal_block_tail);
-
-	// commit_transaction->t_commit_start_time = ktime_get();
 
 	/*
 	 * First job: lock down the current transaction and wait for
@@ -1341,10 +1345,7 @@ void jbd2_journal_barrier_commit_transaction(journal_t *journal)
 	commit_transaction = journal->j_running_transaction;
 	ver_tid = commit_transaction->t_tid % MAX_JH_VERSION;
 
-	// commit_transaction->t_commit_start_time = ktime_get();
-#ifdef DEBUG_PROC_OP
-	c_wait_start = ktime_get();
-#endif
+	commit_transaction->t_commit_start_time = ktime_get();
 
 #ifdef OP_COALESCING
 op_coalescing:
@@ -1412,18 +1413,6 @@ op_coalescing:
 		         !atomic_read(&commit_transaction->t_conflict_count));
 	}
 	write_lock(&journal->j_state_lock);
-#endif
-#ifdef DEBUG_PROC_OP
-	seq = atomic_add_return(1, &op_index);
-	commit_transaction->seq = seq;
-	op_array[seq - 1].op_intv[0] = 
-		commit_transaction->t_tid;
-	op_array[seq - 1].op_intv[1] = 
-		atomic_read(&commit_transaction->t_pconflict_count);
-	op_array[seq - 1].op_intv[2] = 
-		ktime_to_ns(ktime_sub(ktime_get(), c_wait_start));
-	// seq = atomic_add_return(1, &cc_index);
-	// cc_array[seq - 1].cc_intv[0] = atomic_read(&commit_transaction->t_pconflict_count);
 #endif
 
 	/*
@@ -1632,10 +1621,15 @@ op_coalescing:
 		 */
 		set_bit(BH_JWrite, &jh2bh(jh)->b_state);
 		JBUFFER_TRACE(jh, "ph3: write metadata");
-		// seq = atomic_add_return(1, &op_index);
-		start = ktime_get();
+#ifdef DEBUG_PROC_OP
+		start_copy = ktime_get();
+#endif
 		flags = jbd2_journal_write_metadata_buffer(commit_transaction,
 						jh, &wbuf[bufs], blocknr);
+#ifdef DEBUG_PROC_OP
+		end_copy = ktime_get();
+		debug_shadow_copy_time += ktime_sub(end_copy, start_copy);
+#endif
 		// op_array[seq - 1].op_intv[0] = ktime_to_ns(ktime_sub(ktime_get(),start));
 		if (flags < 0) {
 			jbd2_journal_abort(journal, flags);
@@ -1725,7 +1719,8 @@ start_journal_io:
 	}
 
 #ifdef DEBUG_PROC_OP
-	// op_array[seq - 1].op_intv[1] = ktime_to_ns(ktime_sub(ktime_get(), dispatch_start));
+	commit_transaction->seq = seq;
+	op_array[seq - 1].op_intv[0] = debug_shadow_copy_time;
 #endif
 
 	err = journal_finish_inode_data_buffers(journal, commit_transaction);
@@ -1891,6 +1886,10 @@ start_journal_io:
 	if (journal->j_fc_cleanup_callback)
 		journal->j_fc_cleanup_callback(journal, 1, commit_transaction->t_tid);
 
+#ifdef DEBUG_PROC_OP
+	op_array[seq - 1].op_intv[1] = ktime_sub(ktime_get(), commit_transaction->t_commit_start_time);
+#endif
+
 	trace_jbd2_end_commit(journal, commit_transaction);
 	jbd_debug(1, "JBD2: commit %d complete, head %d\n",
 		  journal->j_commit_sequence, journal->j_tail_sequence);
@@ -1934,6 +1933,9 @@ void jbd2_journal_barrier_flush_transaction(journal_t *journal)
 
 	commit_transaction = journal->j_flushing_transactions;
 	ver_tid = commit_transaction->t_tid % MAX_JH_VERSION;
+#ifdef DEUBG_PROC_OP
+	seq = commit_transaction->seq;
+#endif
 #ifdef COMPOUND_FLUSH
 	flush_tid = commit_transaction->t_tid % COMPOUND_FLUSH;
 	commit_empty = journal->j_flushing_transactions 
@@ -2041,13 +2043,6 @@ void jbd2_journal_barrier_flush_transaction(journal_t *journal)
 		// printk(KERN_INFO "[SWDBG] (%s) tid : %d, wait on flush ! flush_tid : %d, commit_emtpy : %d\n"
 		//	,__func__, commit_transaction->t_tid, flush_tid, commit_empty);
 	}
-#ifdef DEBUG_PROC_OP
-	seq = commit_transaction->seq;
-	op_array[seq - 1].op_intv[3] = 
-		commit_transaction->stats.run.rs_blocks;
-	op_array[seq - 1].op_intv[4] = 
-		((journal->j_flags & JBD2_BARRIER) && (flush_tid == 0 || commit_empty == 1)) ? 1 : 0;
-#endif
 #else
 	if (journal->j_flags & JBD2_BARRIER) {
 		blkdev_issue_flush(journal->j_dev);
@@ -2313,5 +2308,7 @@ restart_loop:
 	if (journal->j_flushing_transactions == commit_transaction)
 		journal->j_flushing_transactions = NULL;
 	spin_unlock(&journal->j_list_lock);
-	
+#ifdef DEBUG_PROC_OP
+	op_array[seq - 1].op_intv[2] = ktime_sub(ktime_get(), commit_transaction->t_commit_start_time);
+#endif
 }

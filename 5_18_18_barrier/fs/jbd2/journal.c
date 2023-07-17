@@ -1433,6 +1433,10 @@ static int jbd2_op_show(struct seq_file *seq, void *v)
                         op_array[cnt].op_intv[4]);             
                                                                
                 op_array[cnt].op_intv[0] = 0;                  
+                op_array[cnt].op_intv[1] = 0;                  
+                op_array[cnt].op_intv[2] = 0;                  
+                op_array[cnt].op_intv[3] = 0;                  
+                op_array[cnt].op_intv[4] = 0;                  
                 cnt++;                                         
                                                                
                 if (cnt == end || cnt >= 4000000 || end == 0) {

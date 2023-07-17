@@ -1508,6 +1508,11 @@ struct task_struct {
 	ktime_t start;            
 	void *tx;                 
 	
+	u64				ext4_op_trace;
+	int				ext4_op_seq;
+	ktime_t				ext4_debug_start_time;
+	void*				ext4_sbi;
+	
 	/*
 	 * New fields for task_struct should be added above here, so that
 	 * they are included in the randomized portion of task_struct.
