@@ -14,7 +14,6 @@
 #include <linux/slab.h>
 #include <linux/proc_fs.h>
 #include <linux/part_stat.h>
-#include <linux/vmalloc.h>
 
 #include "ext4.h"
 #include "ext4_jbd2.h"
@@ -518,142 +517,6 @@ static struct kobject *ext4_root;
 
 static struct kobject *ext4_feat;
 
-#ifdef DEBUG_PROC_EXT4
-static int ext4_op_show(struct seq_file *seq, struct ext4_sb_info *sbi, int num)
-{
-        int *intptr = NULL;
-        struct ext4_data *op_data_pointer = NULL;
-        int end = 0, i = 0;
-        switch (num) {
-                case 0: // Select Create
-                        intptr = &sbi->create_cnt;
-                        end = atomic_read(&sbi->create_index);
-                        op_data_pointer = sbi->create_latency_array;
-                break;
-                case 1: // Select Unlink
-                        intptr = &sbi->unlink_cnt;
-                        end = atomic_read(&sbi->unlink_index);
-                        op_data_pointer = sbi->unlink_latency_array;
-                break;
-                case 2: // Select fsync
-                        intptr = &sbi->fsync_cnt;
-                        end = atomic_read(&sbi->fsync_index);
-                        op_data_pointer = sbi->fsync_latency_array;
-                break;
-                case 3: // Select Write
-                        intptr = &sbi->write_cnt;
-                        end = atomic_read(&sbi->write_index);
-                        op_data_pointer = sbi->write_latency_array;
-                break;
-        }
-
-        for (i = 0; i < 100; i++) {
-                seq_printf(seq, "%d %d %llu %llu %llu %llu %llu\n",
-                                end, *intptr,
-                                op_data_pointer[*intptr].ext4_intv[0],
-                                op_data_pointer[*intptr].ext4_intv[1],
-                                op_data_pointer[*intptr].ext4_intv[2],
-                                op_data_pointer[*intptr].ext4_intv[3],
-                                op_data_pointer[*intptr].ext4_intv[4]);
-
-                op_data_pointer[*intptr].ext4_intv[0] = 0;
-                op_data_pointer[*intptr].ext4_intv[1] = 0;
-                op_data_pointer[*intptr].ext4_intv[2] = 0;
-                op_data_pointer[*intptr].ext4_intv[3] = 0;
-                op_data_pointer[*intptr].ext4_intv[4] = 0;
-                *intptr = *intptr + 1;
-
-                if (*intptr == end || *intptr >= 4000000 || end == 0) {
-                        seq_printf(seq, "END\n");
-                        *intptr = 0;
-                        break;
-                }
-        }
-        return 0;
-}
-
-static int ext4_create_show(struct seq_file *seq, void *v)
-{
-        struct super_block *sb = seq->private;
-        struct ext4_sb_info *sbi = EXT4_SB(sb);
-        return ext4_op_show(seq, sbi, 0);
-}
-
-static int ext4_unlink_show(struct seq_file *seq, void *v)
-{
-        struct super_block *sb = seq->private;
-        struct ext4_sb_info *sbi = EXT4_SB(sb);
-        return ext4_op_show(seq, sbi, 1);
-}
-
-static int ext4_fsync_show(struct seq_file *seq, void *v)
-{
-        struct super_block *sb = seq->private;
-        struct ext4_sb_info *sbi = EXT4_SB(sb);
-        return ext4_op_show(seq, sbi, 2);
-}
-
-static int ext4_write_show(struct seq_file *seq, void *v)
-{
-        struct super_block *sb = seq->private;
-        struct ext4_sb_info *sbi = EXT4_SB(sb);
-        return ext4_op_show(seq, sbi, 3);
-}
-
-static int ext4_op_release(struct inode *inode, struct file *file)
-{
-        return single_release(inode, file);
-}
-
-static int ext4_create_open(struct inode *inode, struct file *file)
-{
-        return single_open(file, ext4_create_show, pde_data(inode));
-}
-
-static int ext4_unlink_open(struct inode *inode, struct file *file)
-{
-        return single_open(file, ext4_unlink_show, pde_data(inode));
-}
-
-static int ext4_fsync_open(struct inode *inode, struct file *file)
-{
-        return single_open(file, ext4_fsync_show, pde_data(inode));
-}
-
-static int ext4_write_open(struct inode *inode, struct file *file)
-{
-        return single_open(file, ext4_write_show, pde_data(inode));
-}
-
-static const struct proc_ops ext4_create_proc_ops = {
-        .proc_open      = ext4_create_open,
-        .proc_read      = seq_read,
-        .proc_lseek     = seq_lseek,
-        .proc_release   = ext4_op_release,
-};
-
-static const struct proc_ops ext4_unlink_proc_ops = {
-        .proc_open      = ext4_unlink_open,
-        .proc_read      = seq_read,
-       .proc_lseek     = seq_lseek,
-        .proc_release   = ext4_op_release,
-};
-
-static const struct proc_ops ext4_fsync_proc_ops = {
-        .proc_open      = ext4_fsync_open,
-        .proc_read      = seq_read,
-        .proc_lseek     = seq_lseek,
-        .proc_release   = ext4_op_release,
-};
-
-static const struct proc_ops ext4_write_proc_ops = {
-        .proc_open      = ext4_write_open,
-        .proc_read      = seq_read,
-        .proc_lseek     = seq_lseek,
-        .proc_release   = ext4_op_release,
-};
-#endif
-
 int ext4_register_sysfs(struct super_block *sb)
 {
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
@@ -684,20 +547,6 @@ int ext4_register_sysfs(struct super_block *sb)
 				ext4_seq_mb_stats_show, sb);
 		proc_create_seq_data("mb_structs_summary", 0444, sbi->s_proc,
 				&ext4_mb_seq_structs_summary_ops, sb);
-#ifdef DEBUG_PROC_EXT4
-                atomic_set(&sbi->create_index, 0);
-                sbi->create_latency_array = vzalloc(sizeof(struct ext4_data) * 4000000);
-                proc_create_data("create", S_IRUGO, sbi->s_proc, &ext4_create_proc_ops, sb);
-                atomic_set(&sbi->unlink_index, 0);
-                sbi->unlink_latency_array = vzalloc(sizeof(struct ext4_data) * 4000000);
-                proc_create_data("unlink", S_IRUGO, sbi->s_proc, &ext4_unlink_proc_ops, sb);
-                atomic_set(&sbi->fsync_index, 0);
-                sbi->fsync_latency_array = vzalloc(sizeof(struct ext4_data) * 4000000);
-                proc_create_data("fsync", S_IRUGO, sbi->s_proc, &ext4_fsync_proc_ops, sb);
-                atomic_set(&sbi->write_index, 0);
-                sbi->write_latency_array = vzalloc(sizeof(struct ext4_data) * 4000000);
-                proc_create_data("write", S_IRUGO, sbi->s_proc, &ext4_write_proc_ops, sb);
-#endif
 	}
 	return 0;
 }

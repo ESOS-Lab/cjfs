@@ -258,13 +258,6 @@ static ssize_t ext4_buffered_write_iter(struct kiocb *iocb,
 	ssize_t ret;
 	struct inode *inode = file_inode(iocb->ki_filp);
 
-#ifdef DEBUG_PROC_EXT4
-        struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
-        current->ext4_sbi = sbi;
-        current->ext4_op_trace |= DEBUG_TRACE_WRITE;
-        current->ext4_op_seq = atomic_add_return(1, &sbi->write_index);
-        current->ext4_debug_start_time = ktime_get();
-#endif
 	if (iocb->ki_flags & IOCB_NOWAIT)
 		return -EOPNOTSUPP;
 
@@ -283,11 +276,7 @@ out:
 		iocb->ki_pos += ret;
 		ret = generic_write_sync(iocb, ret);
 	}
-#ifdef DEBUG_PROC_EXT4
-        sbi->write_latency_array[current->ext4_op_seq - 1].ext4_intv[0] =
-                ktime_sub(ktime_get(), current->ext4_debug_start_time);
-        current->ext4_op_trace &= ~DEBUG_TRACE_WRITE;
-#endif
+
 	return ret;
 }
 

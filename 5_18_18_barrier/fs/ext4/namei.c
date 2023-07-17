@@ -2785,13 +2785,6 @@ static int ext4_create(struct user_namespace *mnt_userns, struct inode *dir,
 	handle_t *handle;
 	struct inode *inode;
 	int err, credits, retries = 0;
-#ifdef DEBUG_PROC_EXT4
-        struct ext4_sb_info *sbi = EXT4_SB(dir->i_sb);
-        current->ext4_sbi = sbi;
-        current->ext4_op_trace |= DEBUG_TRACE_CREATE;
-        current->ext4_op_seq = atomic_add_return(1, &sbi->create_index);
-        current->ext4_debug_start_time = ktime_get();
-#endif
 
 	err = dquot_initialize(dir);
 	if (err)
@@ -2818,11 +2811,6 @@ retry:
 		iput(inode);
 	if (err == -ENOSPC && ext4_should_retry_alloc(dir->i_sb, &retries))
 		goto retry;
-#ifdef DEBUG_PROC_EXT4
-        sbi->create_latency_array[current->ext4_op_seq - 1].ext4_intv[0] =
-                ktime_sub(ktime_get(), current->ext4_debug_start_time);
-        current->ext4_op_trace &= ~DEBUG_TRACE_CREATE;
-#endif
 	return err;
 }
 
@@ -3267,13 +3255,6 @@ static int ext4_unlink(struct inode *dir, struct dentry *dentry)
 {
 	handle_t *handle;
 	int retval;
-#ifdef DEBUG_PROC_EXT4
-        struct ext4_sb_info *sbi = EXT4_SB(dir->i_sb);
-        current->ext4_sbi = sbi;
-        current->ext4_op_trace |= DEBUG_TRACE_UNLINK;
-        current->ext4_op_seq = atomic_add_return(1, &sbi->unlink_index);
-        current->ext4_debug_start_time = ktime_get();
-#endif
 
 	if (unlikely(ext4_forced_shutdown(EXT4_SB(dir->i_sb))))
 		return -EIO;
@@ -3312,11 +3293,7 @@ static int ext4_unlink(struct inode *dir, struct dentry *dentry)
 #endif
 	if (handle)
 		ext4_journal_stop(handle);
-#ifdef DEBUG_PROC_EXT4
-        sbi->unlink_latency_array[current->ext4_op_seq - 1].ext4_intv[0] =
-                ktime_sub(ktime_get(), current->ext4_debug_start_time);
-        current->ext4_op_trace &= ~DEBUG_TRACE_UNLINK;
-#endif
+
 out_trace:
 	trace_ext4_unlink_exit(dentry, retval);
 	return retval;

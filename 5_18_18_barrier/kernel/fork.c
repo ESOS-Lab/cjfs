@@ -1051,9 +1051,6 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 #ifdef CONFIG_MEMCG
 	tsk->active_memcg = NULL;
 #endif
-	tsk->ext4_op_trace = 0;
-	tsk->ext4_op_seq = 0;
-	tsk->ext4_debug_start_time = 0;
 	return tsk;
 
 free_stack:

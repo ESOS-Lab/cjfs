@@ -46,13 +46,6 @@
 
 #include <linux/compiler.h>
 
-#define DEBUG_PROC_EXT4
-
-#define DEBUG_TRACE_CREATE 1ULL
-#define DEBUG_TRACE_UNLINK 1ULL << 1
-#define DEBUG_TRACE_WRITE 1ULL << 2
-#define DEBUG_TRACE_FSYNC 1ULL << 3
-
 /*
  * The fourth extended filesystem constants/structures
  */
@@ -1500,12 +1493,6 @@ struct ext4_orphan_info {
 						 * file blocks */
 };
 
-#ifdef DEBUG_PROC_EXT4
-struct ext4_data {
-	u64 ext4_intv[5];
-};
-#endif
-
 /*
  * fourth extended-fs super-block data in memory
  */
@@ -1764,20 +1751,6 @@ struct ext4_sb_info {
 	int s_fc_debug_max_replay;
 #endif
 	struct ext4_fc_replay_state s_fc_replay_state;
-#ifdef DEBUG_PROC_EXT4
-	int			create_cnt;
-	atomic_t		create_index;
-	struct ext4_data*	create_latency_array;
-	int			unlink_cnt;
-	atomic_t		unlink_index;
-	struct ext4_data*	unlink_latency_array;
-	int			write_cnt;
-	atomic_t		write_index;
-	struct ext4_data*	write_latency_array;
-	int			fsync_cnt;
-	atomic_t		fsync_index;
-	struct ext4_data*	fsync_latency_array;
-#endif
 };
 
 static inline struct ext4_sb_info *EXT4_SB(struct super_block *sb)

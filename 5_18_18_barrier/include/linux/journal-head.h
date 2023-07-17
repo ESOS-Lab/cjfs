@@ -16,9 +16,8 @@
 #define MAX_JH_VERSION 1
 // #define COMPOUND_FLUSH 5
 // #define PSP 
-#define DEBUG_PROC_OP
+// #define DEBUG_PROC_OP
 // #define DEBUG_FSYNC_LATENCY
-// #define DEBUG_PROC_EXT4
 
 #include <linux/spinlock.h>
 

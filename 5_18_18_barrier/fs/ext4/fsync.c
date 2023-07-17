@@ -141,13 +141,10 @@ int ext4_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
 	bool needs_barrier = false;
 	struct inode *inode = file->f_mapping->host;
 	struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
+	struct ext4_inode_info *ei = EXT4_I(inode);
 	
-#ifdef DEBUG_PROC_EXT4
-        current->ext4_sbi = sbi;
-        current->ext4_op_trace |= DEBUG_TRACE_FSYNC;
-        current->ext4_op_seq = atomic_add_return(1, &sbi->fsync_index);
-        current->ext4_debug_start_time = ktime_get();
-#endif
+	/* CJFS debug */
+	journal_t *journal = EXT4_SB(inode->i_sb)->s_journal;
 	
 #ifdef DEBUG_FSYNC_LATENCY
 	ktime_t start1, end1;
@@ -247,11 +244,6 @@ out:
         fsync_array[seq-1].fsync_intv[2] = temp.fsync_intv[2];
         fsync_array[seq-1].fsync_intv[3] = temp.fsync_intv[3];
         fsync_array[seq-1].fsync_intv[4] = temp.fsync_intv[4];
-#endif
-#ifdef DEBUG_PROC_EXT4
-        sbi->fsync_latency_array[current->ext4_op_seq - 1].ext4_intv[0] =
-                ktime_sub(ktime_get(), current->ext4_debug_start_time);
-        current->ext4_op_trace &= ~DEBUG_TRACE_FSYNC;
 #endif
 	return ret;
 }

@@ -992,13 +992,6 @@ do_get_write_access(handle_t *handle, struct journal_head *jh,
 	int ver_tid = transaction->t_tid % MAX_JH_VERSION;
 	int commit_tid;
 
-#ifdef DEBUG_PROC_EXT4
-        ktime_t debug_start_time = ktime_get();
-        ktime_t wait_time_start = 0, wait_time = 0;
-        struct ext4_sb_info *sbi = current->ext4_sbi;
-        unsigned int wait_count = 0;
-#endif
-
 	journal = transaction->t_journal;
 
 	jbd_debug(5, "journal_head %p, force_copy %d\n", jh, force_copy);
@@ -1223,26 +1216,6 @@ out:
 		jbd2_free(frozen_buffer, bh->b_size);
 
 	JBUFFER_TRACE(jh, "exit");
-#ifdef DEBUG_PROC_EXT4
-        switch (current->ext4_op_trace) {
-                case DEBUG_TRACE_CREATE:
-                sbi->create_latency_array[current->ext4_op_seq - 1].ext4_intv[1] +=
-                        ktime_sub(ktime_get(), debug_start_time);
-                break;
-                case DEBUG_TRACE_UNLINK:
-                sbi->unlink_latency_array[current->ext4_op_seq - 1].ext4_intv[1] +=
-                        ktime_sub(ktime_get(), debug_start_time);
-                break;
-                case DEBUG_TRACE_WRITE:
-                sbi->write_latency_array[current->ext4_op_seq - 1].ext4_intv[1] +=
-                        ktime_sub(ktime_get(), debug_start_time);
-                break;
-                case DEBUG_TRACE_FSYNC:
-                sbi->fsync_latency_array[current->ext4_op_seq - 1].ext4_intv[1] +=
-                        ktime_sub(ktime_get(), debug_start_time);
-                break;
-	}
-#endif
 	return error;
 }
 
@@ -1323,26 +1296,8 @@ int jbd2_journal_get_write_access(handle_t *handle, struct buffer_head *bh)
 	if (is_handle_aborted(handle))
 		return -EROFS;
 
-	if (jbd2_write_access_granted(handle, bh, false)) {
-#ifdef DEBUG_PROC_EXT4
-                sbi = current->ext4_sbi;
-                switch (current->ext4_op_trace) {
-                        case DEBUG_TRACE_CREATE:
-                        sbi->create_latency_array[current->ext4_op_seq - 1].ext4_intv[4] += 1;
-                        break;
-                        case DEBUG_TRACE_UNLINK:
-                        sbi->unlink_latency_array[current->ext4_op_seq - 1].ext4_intv[4] += 1;
-                        break;
-                        case DEBUG_TRACE_WRITE:
-                        sbi->write_latency_array[current->ext4_op_seq - 1].ext4_intv[4] += 1;
-                        break;
-                        case DEBUG_TRACE_FSYNC:
-                        sbi->fsync_latency_array[current->ext4_op_seq - 1].ext4_intv[4] += 1;
-                        break;
-		}
-#endif
+	if (jbd2_write_access_granted(handle, bh, false))
 		return 0;
-	}
 
 	jh = jbd2_journal_add_journal_head(bh);
 	/* We do not want to get caught playing with fields which the
@@ -1493,26 +1448,11 @@ int jbd2_journal_get_undo_access(handle_t *handle, struct buffer_head *bh)
 	if (is_handle_aborted(handle))
 		return -EROFS;
 
-	if (jbd2_write_access_granted(handle, bh, true)) {
-#ifdef DEBUG_PROC_EXT4
-                sbi = current->ext4_sbi;
-                switch (current->ext4_op_trace) {
-                        case DEBUG_TRACE_CREATE:
-                        sbi->create_latency_array[current->ext4_op_seq - 1].ext4_intv[4] += 1;
-                        break;
-                        case DEBUG_TRACE_UNLINK:
-                        sbi->unlink_latency_array[current->ext4_op_seq - 1].ext4_intv[4] += 1;
-                        break;
-                        case DEBUG_TRACE_WRITE:
-                        sbi->write_latency_array[current->ext4_op_seq - 1].ext4_intv[4] += 1;
-                        break;
-                        case DEBUG_TRACE_FSYNC:
-                        sbi->fsync_latency_array[current->ext4_op_seq - 1].ext4_intv[4] += 1;
-                        break;
-		}
-#endif
+	if (jbd2_write_access_granted(handle, bh, true))
 		return 0;
-	}
+
+	/* CJFS */
+	dump_stack();
 
 	jh = jbd2_journal_add_journal_head(bh);
 	JBUFFER_TRACE(jh, "entry");
