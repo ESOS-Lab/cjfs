@@ -426,6 +426,7 @@ static int nvme_init_hctx(struct blk_mq_hw_ctx *hctx, void *data,
 
 	WARN_ON(dev->tagset.tags[hctx_idx] != hctx->tags);
 	hctx->driver_data = nvmeq;
+	printk("[JATA DBG] (%s) hctx_idx: %d nvmeq: %p dev->queues: %p\n", __func__, hctx_idx, nvmeq, dev->queues);
 	return 0;
 }
 
@@ -998,9 +999,10 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 
 static void nvme_submit_cmds(struct nvme_queue *nvmeq, struct request **rqlist)
 {
-	spin_lock(&nvmeq->sq_lock);
 	/* UFS */
 	struct request *req = NULL;
+
+	spin_lock(&nvmeq->sq_lock);
 	while (!rq_list_empty(*rqlist)) {
 		req = rq_list_pop(rqlist);
 		struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
@@ -3110,6 +3112,8 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 			sizeof(struct nvme_queue), GFP_KERNEL, node);
 	if (!dev->queues)
 		goto free;
+	// JATA ADDED
+	printk("[JATA DBG] (%s) %p\n", __func__, dev->queues);
 
 	dev->dev = get_device(&pdev->dev);
 	pci_set_drvdata(pdev, dev);

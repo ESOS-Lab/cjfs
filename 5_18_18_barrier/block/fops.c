@@ -475,6 +475,19 @@ static int blkdev_fsync(struct file *filp, loff_t start, loff_t end,
 	return error;
 }
 
+static int blkdev_fbarrier(struct file *filp, loff_t start, loff_t end,
+		int datasync)
+{
+	struct block_device *bdev = filp->private_data;
+	int error;
+
+	error = filemap_ordered_write_range(filp->f_mapping, start, end);
+	filemap_fdatadispatch_range(filp->f_mapping, start, end);
+
+	return error;
+}
+
+
 static int blkdev_open(struct inode *inode, struct file *filp)
 {
 	struct block_device *bdev;
@@ -691,7 +704,9 @@ const struct file_operations def_blk_fops = {
 	.write_iter	= blkdev_write_iter,
 	.iopoll		= iocb_bio_iopoll,
 	.mmap		= generic_file_mmap,
-	.fsync		= blkdev_fsync,
+	//.fsync		= blkdev_fsync,
+	.fsync		= blkdev_fbarrier,
+	//.fbarrier	= blkdev_fbarrier,
 	.unlocked_ioctl	= blkdev_ioctl,
 #ifdef CONFIG_COMPAT
 	.compat_ioctl	= compat_blkdev_ioctl,

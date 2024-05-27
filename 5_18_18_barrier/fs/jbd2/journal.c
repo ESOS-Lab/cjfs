@@ -371,9 +371,31 @@ loop:
 	else
 		spin_unlock(&journal->j_list_lock);
 
-	wait_event(journal->j_wait_flush,
+	/*wait_event(journal->j_wait_flush,
 	           (journal->j_flushing_transactions != NULL)
-	           || (journal->j_flags & JBD2_UNMOUNT));
+	           || (journal->j_flags & JBD2_UNMOUNT));*/
+
+	if (freezing(current)) {
+		/*
+		 * The simpler the better. Flushing journal isn't a
+		 * good idea, because that depends on threads that may
+		 * be already stopped.
+		 */
+		jbd_debug(1, "Now suspending kjournald2flush\n");
+		try_to_freeze();
+	} else {
+		/*
+		 * We assume on resume that commits are already there,
+		 * so we don't sleep
+		 */
+		DEFINE_WAIT(wait);
+
+		prepare_to_wait(&journal->j_wait_flush, &wait,
+				TASK_INTERRUPTIBLE);
+		schedule();
+		finish_wait(&journal->j_wait_flush, &wait);
+	}
+
 
 	goto loop;
 
